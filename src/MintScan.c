@@ -42,12 +42,14 @@ typedef long ssize_t;
 #define GAD_SCAN_BUTTON      10
 #define GAD_SAVE_BUTTON      11
 #define GAD_EXIT_BUTTON      12
+#define GAD_IP_STRING        13
+#define GAD_QUERY_BUTTON     14
 
 #define MAX_DISCOVERY_RESULTS 16
 #define MAX_BUFFER    65536   /* capabilities / ScanJobs response scratch */
 #define MAX_OUTPUT_LINES 8
 #define MAX_OUTPUT_LINE_LENGTH 55
-#define OUTPUT_TOP    225
+#define OUTPUT_TOP    245
 #define OUTPUT_LEFT   10
 #define OUTPUT_LINE_H 10
 #define OUTPUT_RIGHT  (window->Width - 20)
@@ -98,6 +100,12 @@ static int format_index = 0; /* JPEG */
 static int size_index = 0;  /* A4 */
 
 static char savepath_buffer[256] = "RAM:scan001.jpg";
+
+/* Manual entry, for setups where mDNS multicast doesn't reach the Amiga
+   (e.g. WinUAE's SLIRP networking, which doesn't route 224.0.0.251) -
+   the GUI's own backing store for GAD_IP_STRING. Accepts "host" or
+   "host:port"; port defaults to 80. */
+static char ip_entry_buffer[70] = "";
 
 static char output_buffer[MAX_OUTPUT_LINES][MAX_OUTPUT_LINE_LENGTH];
 static int output_line = 0;
@@ -503,6 +511,58 @@ static void select_discovered_scanner(int idx) {
     strncpy(scanner_host, discovered[idx].ip, sizeof(scanner_host) - 1);
     scanner_host[sizeof(scanner_host) - 1] = '\0';
     scanner_port = 80;
+}
+
+/* Parses "host" or "host:port" out of the IP entry field. Returns FALSE
+   (leaving the outputs untouched) if there's no host to parse. */
+static BOOL parse_host_port(const char *input, char *host_out, int host_size, int *port_out) {
+    const char *colon;
+    int len;
+
+    while (*input == ' ') input++;
+    if (!*input) return FALSE;
+
+    colon = strchr(input, ':');
+    len = colon ? (int)(colon - input) : (int)strlen(input);
+    if (len <= 0 || len >= host_size) return FALSE;
+
+    memcpy(host_out, input, len);
+    host_out[len] = '\0';
+
+    *port_out = 80;
+    if (colon && colon[1]) {
+        int p = atoi(colon + 1);
+        if (p >= 1 && p <= 65535) *port_out = p;
+    }
+    return TRUE;
+}
+
+/* Adds (or updates) a manually-entered scanner in discovered[] - same
+   list mDNS discovery populates - so it shows up in the Scanner dropdown
+   and can be picked up by Save Config like a discovered one, then makes
+   it the active scanner. Returns its index, or -1 if the list is full
+   and this host wasn't already in it. */
+static int add_or_select_manual_ip(const char *host, int port) {
+    int i, idx = -1;
+
+    for (i = 0; i < discovered_count; i++) {
+        if (strcmp(discovered[i].ip, host) == 0) { idx = i; break; }
+    }
+    if (idx < 0 && discovered_count < MAX_DISCOVERY_RESULTS) {
+        idx = discovered_count++;
+        strncpy(discovered[idx].ip, host, sizeof(discovered[idx].ip) - 1);
+        discovered[idx].ip[sizeof(discovered[idx].ip) - 1] = '\0';
+    }
+    if (idx >= 0) {
+        snprintf(discovered[idx].label, sizeof(discovered[idx].label), "%s (manual)", host);
+    }
+
+    strncpy(scanner_host, host, sizeof(scanner_host) - 1);
+    scanner_host[sizeof(scanner_host) - 1] = '\0';
+    scanner_port = port;
+
+    rebuild_scanner_dropdown();
+    return idx;
 }
 
 /* --------------------------------------------------------------------
@@ -957,6 +1017,33 @@ static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWOR
     if (!gad) return NULL;
     ng.ng_Flags = NG_HIGHLABEL;
 
+    /* Manual entry, for setups (e.g. WinUAE) where mDNS multicast never
+       reaches the Amiga - type an IP (or "ip:port") and Query it directly,
+       no discovery needed. */
+    ng.ng_LeftEdge = 100;
+    ng.ng_TopEdge += 20;
+    ng.ng_Width = 250;
+    ng.ng_Height = 14;
+    ng.ng_GadgetText = (STRPTR)"_IP:";
+    ng.ng_GadgetID = GAD_IP_STRING;
+    gad = CreateGadget(STRING_KIND, gad, &ng,
+        GTST_String, (ULONG)ip_entry_buffer,
+        GTST_MaxChars, sizeof(ip_entry_buffer) - 1,
+        GA_Immediate, TRUE,
+        GT_Underscore, '_',
+        GACT_RELVERIFY, TRUE,
+        TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_LeftEdge = 370;
+    ng.ng_Width = 90;
+    ng.ng_GadgetText = (STRPTR)"_Query";
+    ng.ng_GadgetID = GAD_QUERY_BUTTON;
+    ng.ng_Flags = 0;
+    gad = CreateGadget(BUTTON_KIND, gad, &ng, GT_Underscore, '_', TAG_DONE);
+    if (!gad) return NULL;
+    ng.ng_Flags = NG_HIGHLABEL;
+
     ng.ng_LeftEdge = 100;
     ng.ng_TopEdge += 20;
     ng.ng_Width = 350;
@@ -1105,6 +1192,35 @@ static void process_window_events(struct Window *win) {
                                 operation_in_progress = FALSE;
                             }
                             break;
+                        case GAD_QUERY_BUTTON:
+                            if (!operation_in_progress) {
+                                char host[64];
+                                int port;
+                                operation_in_progress = TRUE;
+                                if (parse_host_port(ip_entry_buffer, host, sizeof(host), &port)) {
+                                    int idx = add_or_select_manual_ip(host, port);
+                                    struct Gadget *sg, *mg;
+                                    query_capabilities(scanner_host, scanner_port);
+                                    sg = find_gadget_by_id(win, GAD_SCANNER_DROPDOWN);
+                                    if (sg) {
+                                        GT_SetGadgetAttrs(sg, win, NULL,
+                                            GTCY_Labels, (ULONG)scanner_dropdown_labels,
+                                            GTCY_Active, (ULONG)(idx >= 0 ? idx : 0), TAG_DONE);
+                                    }
+                                    mg = find_model_gadget(win);
+                                    if (mg) {
+                                        GT_SetGadgetAttrs(mg, win, NULL,
+                                                           GTST_String, (ULONG)scanner_make_model, TAG_DONE);
+                                    }
+                                } else {
+                                    printf("Enter a scanner IP first\n");
+                                }
+                                operation_in_progress = FALSE;
+                            }
+                            break;
+                        case GAD_IP_STRING:
+                            /* ip_entry_buffer is the gadget's own backing store */
+                            break;
                         case GAD_SOURCE_DROPDOWN: {
                             ULONG v = 0;
                             GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&v, TAG_DONE);
@@ -1243,6 +1359,14 @@ int main(void) {
 
     load_config();
     rebuild_scanner_dropdown();
+    if (scanner_host[0]) {
+        if (scanner_port != 80) {
+            snprintf(ip_entry_buffer, sizeof(ip_entry_buffer), "%s:%d", scanner_host, scanner_port);
+        } else {
+            strncpy(ip_entry_buffer, scanner_host, sizeof(ip_entry_buffer) - 1);
+            ip_entry_buffer[sizeof(ip_entry_buffer) - 1] = '\0';
+        }
+    }
 
     if (!createAllGadgets(&glist, vi, topborder)) {
         FreeVisualInfo(vi);
@@ -1261,8 +1385,8 @@ int main(void) {
         WA_AutoAdjust, TRUE,
         WA_Width, 480,
         WA_MinWidth, 480,
-        WA_InnerHeight, 320,
-        WA_MinHeight, 320,
+        WA_InnerHeight, 340,
+        WA_MinHeight, 340,
         WA_DragBar, TRUE,
         WA_DepthGadget, TRUE,
         WA_Activate, TRUE,

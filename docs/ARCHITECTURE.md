@@ -37,6 +37,12 @@ supplies the real details.
 eSCL scanners are not reliably discoverable via SSDP the way AirPrint
 printers are, so - unlike MintPRINT - there is no SSDP pass here.
 
+mDNS multicast doesn't reach every environment - notably WinUAE's SLIRP
+networking, which doesn't route 224.0.0.251 (`no route to 224.0.0.251?`
+in the status box). The IP field next to Discover exists for exactly
+this: type an IP (or `ip:port`) and click Query to skip discovery
+entirely and go straight to `ScannerCapabilities`.
+
 ## Known limitations / next steps
 
 - **`NextDocument` download assumes `Content-Length` or a server that
