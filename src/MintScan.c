@@ -89,30 +89,48 @@ static BOOL have_capabilities = FALSE;
 static STRPTR source_labels[] = { (STRPTR)"Flatbed", (STRPTR)"Feeder (ADF)", NULL };
 static const char *source_values[] = { "Platen", "Feeder" };
 
-/* Master list of eSCL colour modes this GUI knows about. Colour options
-   start as this full set, but get filtered down to whatever the scanner
-   actually advertises in ScannerCapabilities the first time a query
-   succeeds - see update_color_options_from_capabilities(). Same failure
-   mode as DPI: a ColorMode the scanner doesn't support can get silently
-   substituted rather than rejected. */
+/* Colour dropdown - a fixed, never-swapped list (see the long comment on
+   dpi_gui_values below for why it stays fixed). color_index indexes both
+   arrays directly (1:1, no filtering). */
 #define COLOR_MODE_COUNT 3
-static const char *color_all_labels[COLOR_MODE_COUNT] = { "Colour", "Grayscale", "Black & White" };
+static STRPTR color_all_labels[COLOR_MODE_COUNT + 1] = {
+    (STRPTR)"Colour", (STRPTR)"Grayscale", (STRPTR)"Black & White", NULL
+};
 static const char *color_all_values[COLOR_MODE_COUNT] = { "RGB24", "Grayscale8", "BlackAndWhite1" };
 
-static STRPTR color_option_labels[COLOR_MODE_COUNT + 1];
-static int color_option_master[COLOR_MODE_COUNT] = { 0, 1, 2 }; /* index into color_all_* */
-static int color_option_count = COLOR_MODE_COUNT;
+/* Which of color_all_values[] the scanner's ScannerCapabilities response
+   actually mentions (indices into color_all_values) - populated by
+   update_color_options_from_capabilities(), used only to snap the
+   request in build_scan_settings_xml(), never to change the dropdown
+   itself. See the dpi_supported_* comment below for why. */
+static int color_supported_master[COLOR_MODE_COUNT];
+static int color_supported_count = 0;
 
-/* DPI options start as this fixed guess, but get replaced with whatever
-   the scanner actually advertises in ScannerCapabilities the first time
-   a query succeeds - see update_dpi_options_from_capabilities(). Several
-   real eSCL scanners (Brother's included) silently substitute their own
-   default resolution rather than erroring when asked for one they don't
-   support, so offering only what's actually supported matters. */
-static int dpi_option_values[MAX_DPI_OPTIONS] = { 100, 150, 200, 300, 600 };
-static int dpi_option_count = 5;
-static char dpi_option_storage[MAX_DPI_OPTIONS][8];
-static STRPTR dpi_option_labels[MAX_DPI_OPTIONS + 1];
+/* DPI dropdown - a fixed, never-swapped list. Tried making this (and
+   Colour, above) reflect ScannerCapabilities by swapping the live
+   gadget's GTCY_Labels/GTCY_Active after a query - confirmed by testing
+   that this breaks selection entirely (values shown but not honoured).
+   That matches a documented GadTools gotcha MintPRINT already works
+   around: repeatedly swapping a CYCLE_KIND gadget's label array while
+   it's live can desync its internal active-index tracking on this
+   NDK/GadTools combo, even though nothing crashes and the new labels
+   *display* correctly. Source/Format/Size never get swapped and have
+   never shown this problem - Colour and DPI were the only two gadgets
+   that did. Instead: keep the dropdown static, and validate/snap
+   against what the scanner actually supports right when the request is
+   built - see resolve_dpi() and resolve_color_value(). */
+static const int dpi_gui_values[] = { 100, 150, 200, 300, 600 };
+static STRPTR dpi_gui_labels[] = {
+    (STRPTR)"100", (STRPTR)"150", (STRPTR)"200", (STRPTR)"300", (STRPTR)"600", NULL
+};
+#define DPI_GUI_COUNT 5
+
+/* Which resolutions the scanner's ScannerCapabilities response actually
+   advertises (not necessarily a subset of dpi_gui_values - could include
+   values the fixed dropdown doesn't even list) - populated by
+   update_dpi_options_from_capabilities(), used only to snap the request. */
+static int dpi_supported_values[MAX_DPI_OPTIONS];
+static int dpi_supported_count = 0;
 
 static STRPTR format_labels[] = { (STRPTR)"JPEG", (STRPTR)"PNG", (STRPTR)"PDF", NULL };
 static const char *format_mimes[] = { "image/jpeg", "image/png", "application/pdf" };
@@ -296,9 +314,9 @@ static BOOL write_config_file(CONST_STRPTR filename) {
     FPuts(file, (STRPTR)line);
     snprintf(line, sizeof(line), "SOURCE=%s\n", source_values[source_index]);
     FPuts(file, (STRPTR)line);
-    snprintf(line, sizeof(line), "COLORMODE=%s\n", color_all_values[color_option_master[color_index]]);
+    snprintf(line, sizeof(line), "COLORMODE=%s\n", color_all_values[color_index]);
     FPuts(file, (STRPTR)line);
-    snprintf(line, sizeof(line), "RESOLUTION=%d\n", dpi_option_values[dpi_index]);
+    snprintf(line, sizeof(line), "RESOLUTION=%d\n", dpi_gui_values[dpi_index]);
     FPuts(file, (STRPTR)line);
     snprintf(line, sizeof(line), "FORMAT=%s\n", format_mimes[format_index]);
     FPuts(file, (STRPTR)line);
@@ -356,16 +374,12 @@ static void load_config(void) {
             idx = find_label_index(source_values, 2, line + 7);
             if (idx >= 0) source_index = idx;
         } else if (strncmp(line, "COLORMODE=", 10) == 0) {
-            for (idx = 0; idx < color_option_count; idx++) {
-                if (strcmp(color_all_values[color_option_master[idx]], line + 10) == 0) {
-                    color_index = idx;
-                    break;
-                }
-            }
+            idx = find_label_index(color_all_values, COLOR_MODE_COUNT, line + 10);
+            if (idx >= 0) color_index = idx;
         } else if (strncmp(line, "RESOLUTION=", 11) == 0) {
             int r = atoi(line + 11);
-            for (idx = 0; idx < dpi_option_count; idx++) {
-                if (dpi_option_values[idx] == r) { dpi_index = idx; break; }
+            for (idx = 0; idx < DPI_GUI_COUNT; idx++) {
+                if (dpi_gui_values[idx] == r) { dpi_index = idx; break; }
             }
         } else if (strncmp(line, "FORMAT=", 7) == 0) {
             idx = find_label_index(format_mimes, 3, line + 7);
@@ -524,34 +538,19 @@ static int mdns_discover_scanners(int count_io, int max_results, const char **la
     return count;
 }
 
-static void rebuild_dpi_dropdown(void) {
-    int i;
-
-    for (i = 0; i < dpi_option_count; i++) {
-        snprintf(dpi_option_storage[i], sizeof(dpi_option_storage[i]), "%d", dpi_option_values[i]);
-        dpi_option_labels[i] = (STRPTR)dpi_option_storage[i];
-    }
-    dpi_option_labels[dpi_option_count] = NULL;
-    if (dpi_index >= dpi_option_count) dpi_index = 0;
-}
-
 /* Scrapes every "...XResolution>NNN</..." in a ScannerCapabilities
    response - covering both Platen and Adf DiscreteResolutions - into a
-   sorted, deduplicated DPI option list. Not scoped to the currently
-   selected Source (that would need real element-nesting-aware XML
-   parsing); offering the union is the safer approximation. Leaves the
-   existing options untouched if the scanner doesn't advertise a
-   discrete list at all (e.g. only a resolution range), and tries to
-   keep whatever DPI was already selected - or the closest available
-   one - rather than silently resetting it. */
+   sorted, deduplicated list of what the scanner actually supports.
+   Doesn't touch the dropdown (see the dpi_gui_values comment above for
+   why) - just feeds resolve_dpi(), called when the scan request is
+   built. Leaves dpi_supported_count at 0 (meaning "unknown, don't
+   second-guess the user's selection") if the scanner doesn't advertise
+   a discrete list at all (e.g. only a resolution range). */
 static void update_dpi_options_from_capabilities(const char *xml) {
     int values[MAX_DPI_OPTIONS];
     int count = 0;
-    int current_dpi;
     int i;
     const char *p = xml;
-
-    current_dpi = (dpi_index < dpi_option_count) ? dpi_option_values[dpi_index] : 300;
 
     while ((p = strstr(p, "XResolution>")) != NULL) {
         int v;
@@ -573,57 +572,66 @@ static void update_dpi_options_from_capabilities(const char *xml) {
         values[j + 1] = key;
     }
 
-    for (i = 0; i < count; i++) dpi_option_values[i] = values[i];
-    dpi_option_count = count;
+    for (i = 0; i < count; i++) dpi_supported_values[i] = values[i];
+    dpi_supported_count = count;
+}
 
-    dpi_index = 0;
-    for (i = 0; i < count; i++) {
-        if (dpi_option_values[i] == current_dpi) { dpi_index = i; break; }
-        if (abs(dpi_option_values[i] - current_dpi) < abs(dpi_option_values[dpi_index] - current_dpi)) {
-            dpi_index = i;
+/* Returns the DPI to actually put in the eSCL request: the selected
+   dpi_gui_values[dpi_index] as-is if it's known to be supported (or if
+   we don't know what's supported - no query has run yet), otherwise the
+   closest value the scanner actually advertised. Prints a status line
+   when it substitutes something, so a silent mismatch (the original bug
+   report) is never silent again. */
+static int resolve_dpi(void) {
+    int requested = dpi_gui_values[dpi_index];
+    int i, best;
+
+    if (dpi_supported_count == 0) return requested;
+    for (i = 0; i < dpi_supported_count; i++) {
+        if (dpi_supported_values[i] == requested) return requested;
+    }
+
+    best = dpi_supported_values[0];
+    for (i = 1; i < dpi_supported_count; i++) {
+        if (abs(dpi_supported_values[i] - requested) < abs(best - requested)) {
+            best = dpi_supported_values[i];
         }
     }
-
-    rebuild_dpi_dropdown();
+    printf("%d DPI not supported - using %d DPI\n", requested, best);
+    return best;
 }
 
-static void rebuild_color_dropdown(void) {
-    int i;
-
-    for (i = 0; i < color_option_count; i++) {
-        color_option_labels[i] = (STRPTR)color_all_labels[color_option_master[i]];
-    }
-    color_option_labels[color_option_count] = NULL;
-    if (color_index >= color_option_count) color_index = 0;
-}
-
-/* Filters the Colour dropdown down to whichever of RGB24/Grayscale8/
-   BlackAndWhite1 the scanner's ScannerCapabilities response actually
-   mentions - not scoped to the currently selected Source, same
-   approximation as the DPI scrape above. Leaves the full 3-option set
-   untouched if none of them turn up (e.g. an unrecognised value we
-   don't know the name of), and tries to keep whichever mode was
-   already selected rather than silently resetting it. */
+/* Records which of RGB24/Grayscale8/BlackAndWhite1 the scanner's
+   ScannerCapabilities response actually mentions - not scoped to the
+   currently selected Source, same approximation as the DPI scrape
+   above. Feeds resolve_color_value(); doesn't touch the dropdown. */
 static void update_color_options_from_capabilities(const char *xml) {
-    int previous_master = color_option_master[color_index];
     int count = 0;
     int i;
 
     for (i = 0; i < COLOR_MODE_COUNT; i++) {
         if (strstr(xml, color_all_values[i])) {
-            color_option_master[count++] = i;
+            color_supported_master[count++] = i;
         }
     }
+    color_supported_count = count;
+}
 
-    if (count == 0) return;
+/* Returns the eSCL ColorMode value to actually put in the request: the
+   selected mode as-is if it's supported (or unknown - no query has run
+   yet), otherwise the first mode the scanner does support. Prints a
+   status line when it substitutes something. */
+static const char *resolve_color_value(void) {
+    int i;
 
-    color_option_count = count;
-    color_index = 0;
-    for (i = 0; i < count; i++) {
-        if (color_option_master[i] == previous_master) { color_index = i; break; }
+    if (color_supported_count == 0) return color_all_values[color_index];
+    for (i = 0; i < color_supported_count; i++) {
+        if (color_supported_master[i] == color_index) return color_all_values[color_index];
     }
 
-    rebuild_color_dropdown();
+    printf("%s not supported - using %s\n",
+           (char *)color_all_labels[color_index], (char *)color_all_labels[color_supported_master[0]]);
+    return color_all_values[color_supported_master[0]];
 }
 
 static void rebuild_scanner_dropdown(void) {
@@ -1176,6 +1184,9 @@ static void query_capabilities(const char *ip, int port) {
 }
 
 static void build_scan_settings_xml(char *buf, int buf_size) {
+    int dpi = resolve_dpi();
+    const char *color_value = resolve_color_value();
+
     snprintf(buf, buf_size,
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         "<scan:ScanSettings xmlns:scan=\"http://schemas.hp.com/imaging/escl/2011/05/03\" "
@@ -1196,8 +1207,8 @@ static void build_scan_settings_xml(char *buf, int buf_size) {
         "<pwg:DocumentFormat>%s</pwg:DocumentFormat>\n"
         "</scan:ScanSettings>\n",
         size_height_300[size_index], size_width_300[size_index],
-        source_values[source_index], color_all_values[color_option_master[color_index]],
-        dpi_option_values[dpi_index], dpi_option_values[dpi_index],
+        source_values[source_index], color_value,
+        dpi, dpi,
         format_mimes[format_index]);
 }
 
@@ -1266,8 +1277,6 @@ static void do_discover(void) {
 
 static struct Gadget *find_gadget_by_id(struct Window *win, int id);
 static struct Gadget *find_model_gadget(struct Window *win);
-static struct Gadget *find_dpi_gadget(struct Window *win);
-static struct Gadget *find_color_gadget(struct Window *win);
 static void sync_string_gadget(struct Window *win, int gadget_id, char *dest, int dest_size);
 
 static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWORD topborder) {
@@ -1356,7 +1365,7 @@ static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWOR
     ng.ng_GadgetText = (STRPTR)"Colour:";
     ng.ng_GadgetID = GAD_COLOR_DROPDOWN;
     gad = CreateGadget(CYCLE_KIND, gad, &ng,
-        GTCY_Labels, (ULONG)color_option_labels, GTCY_Active, color_index, TAG_DONE);
+        GTCY_Labels, (ULONG)color_all_labels, GTCY_Active, color_index, TAG_DONE);
     if (!gad) return NULL;
 
     ng.ng_TopEdge += 20;
@@ -1364,7 +1373,7 @@ static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWOR
     ng.ng_GadgetText = (STRPTR)"DPI:";
     ng.ng_GadgetID = GAD_DPI_DROPDOWN;
     gad = CreateGadget(CYCLE_KIND, gad, &ng,
-        GTCY_Labels, (ULONG)dpi_option_labels, GTCY_Active, dpi_index, TAG_DONE);
+        GTCY_Labels, (ULONG)dpi_gui_labels, GTCY_Active, dpi_index, TAG_DONE);
     if (!gad) return NULL;
 
     ng.ng_TopEdge += 20;
@@ -1444,7 +1453,7 @@ static void process_window_events(struct Window *win) {
                         case GAD_SCANNER_DROPDOWN: {
                             if (!operation_in_progress) {
                                 ULONG selected = 0;
-                                struct Gadget *mg, *dg, *cg;
+                                struct Gadget *mg;
                                 operation_in_progress = TRUE;
                                 GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&selected, TAG_DONE);
                                 select_discovered_scanner((int)selected);
@@ -1454,25 +1463,13 @@ static void process_window_events(struct Window *win) {
                                     GT_SetGadgetAttrs(mg, win, NULL,
                                                        GTST_String, (ULONG)scanner_make_model, TAG_DONE);
                                 }
-                                dg = find_dpi_gadget(win);
-                                if (dg) {
-                                    GT_SetGadgetAttrs(dg, win, NULL,
-                                        GTCY_Labels, (ULONG)dpi_option_labels,
-                                        GTCY_Active, (ULONG)dpi_index, TAG_DONE);
-                                }
-                                cg = find_color_gadget(win);
-                                if (cg) {
-                                    GT_SetGadgetAttrs(cg, win, NULL,
-                                        GTCY_Labels, (ULONG)color_option_labels,
-                                        GTCY_Active, (ULONG)color_index, TAG_DONE);
-                                }
                                 operation_in_progress = FALSE;
                             }
                             break;
                         }
                         case GAD_DISCOVER_BUTTON:
                             if (!operation_in_progress) {
-                                struct Gadget *sg, *mg, *dg, *cg;
+                                struct Gadget *sg, *mg;
                                 operation_in_progress = TRUE;
                                 do_discover();
                                 sg = find_gadget_by_id(win, GAD_SCANNER_DROPDOWN);
@@ -1486,18 +1483,6 @@ static void process_window_events(struct Window *win) {
                                     GT_SetGadgetAttrs(mg, win, NULL,
                                                        GTST_String, (ULONG)scanner_make_model, TAG_DONE);
                                 }
-                                dg = find_dpi_gadget(win);
-                                if (dg) {
-                                    GT_SetGadgetAttrs(dg, win, NULL,
-                                        GTCY_Labels, (ULONG)dpi_option_labels,
-                                        GTCY_Active, (ULONG)dpi_index, TAG_DONE);
-                                }
-                                cg = find_color_gadget(win);
-                                if (cg) {
-                                    GT_SetGadgetAttrs(cg, win, NULL,
-                                        GTCY_Labels, (ULONG)color_option_labels,
-                                        GTCY_Active, (ULONG)color_index, TAG_DONE);
-                                }
                                 operation_in_progress = FALSE;
                             }
                             break;
@@ -1509,7 +1494,7 @@ static void process_window_events(struct Window *win) {
                                 sync_string_gadget(win, GAD_IP_STRING, ip_entry_buffer, sizeof(ip_entry_buffer));
                                 if (parse_host_port(ip_entry_buffer, host, sizeof(host), &port)) {
                                     int idx = add_or_select_manual_ip(host, port);
-                                    struct Gadget *sg, *mg, *dg, *cg;
+                                    struct Gadget *sg, *mg;
                                     query_capabilities(scanner_host, scanner_port);
                                     sg = find_gadget_by_id(win, GAD_SCANNER_DROPDOWN);
                                     if (sg) {
@@ -1521,18 +1506,6 @@ static void process_window_events(struct Window *win) {
                                     if (mg) {
                                         GT_SetGadgetAttrs(mg, win, NULL,
                                                            GTST_String, (ULONG)scanner_make_model, TAG_DONE);
-                                    }
-                                    dg = find_dpi_gadget(win);
-                                    if (dg) {
-                                        GT_SetGadgetAttrs(dg, win, NULL,
-                                            GTCY_Labels, (ULONG)dpi_option_labels,
-                                            GTCY_Active, (ULONG)dpi_index, TAG_DONE);
-                                    }
-                                    cg = find_color_gadget(win);
-                                    if (cg) {
-                                        GT_SetGadgetAttrs(cg, win, NULL,
-                                            GTCY_Labels, (ULONG)color_option_labels,
-                                            GTCY_Active, (ULONG)color_index, TAG_DONE);
                                     }
                                 } else {
                                     printf("Enter a scanner IP first\n");
@@ -1656,14 +1629,6 @@ static struct Gadget *find_model_gadget(struct Window *win) {
     return find_gadget_by_id(win, GAD_MODEL_DISPLAY);
 }
 
-static struct Gadget *find_dpi_gadget(struct Window *win) {
-    return find_gadget_by_id(win, GAD_DPI_DROPDOWN);
-}
-
-static struct Gadget *find_color_gadget(struct Window *win) {
-    return find_gadget_by_id(win, GAD_COLOR_DROPDOWN);
-}
-
 /* GTST_String only sets a string gadget's INITIAL text at creation time -
    GadTools keeps its own internal edit buffer after that, so live typing
    never touches the buffer we passed in. GT_GetGadgetAttrs(..., GTST_String,
@@ -1739,8 +1704,6 @@ int main(void) {
 
     load_config();
     rebuild_scanner_dropdown();
-    rebuild_dpi_dropdown();
-    rebuild_color_dropdown();
     if (scanner_host[0]) {
         if (scanner_port != 80) {
             snprintf(ip_entry_buffer, sizeof(ip_entry_buffer), "%s:%d", scanner_host, scanner_port);
