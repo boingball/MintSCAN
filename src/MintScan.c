@@ -26,6 +26,16 @@ typedef long ssize_t;
 #include <stdio.h>
 #include <stdlib.h>
 
+#define USED __attribute__((used))
+
+/* Classic AmigaOS / libnix stack request - same convention as MintPRINT.
+   The "$STACK:" cookie is honoured by newer startup code; classic m68k
+   GCC/libnix runtimes read the __stack variable instead. Keep this
+   comfortably large: GadTools + bsdsocket + the eSCL/chunk-decoder call
+   chains go several frames deep. 384 KiB = 393216 bytes. */
+unsigned long __stack = 393216UL;
+static const char USED min_stack[] = "$STACK:393216";
+
 /* --------------------------------------------------------------------
  * Constants, gadget IDs, globals
  * ----------------------------------------------------------------- */
