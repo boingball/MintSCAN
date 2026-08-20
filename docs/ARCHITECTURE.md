@@ -56,11 +56,15 @@ entirely and go straight to `ScannerCapabilities`.
   works today.
 - **ADF and duplex are not implemented.** `ScanRegions` is always a
   single full-page region at (0,0); there's no multi-page loop.
-- **`ScannerCapabilities` is only lightly scraped** (just
-  `pwg:MakeAndModel`, for display) rather than fully parsed - the GUI's
-  option lists (resolutions, formats, page sizes) are a fixed set picked
-  to match what most eSCL scanners advertise, not what a specific
-  scanner actually reports it supports.
+- **`ScannerCapabilities` is only lightly scraped**, not fully parsed.
+  `pwg:MakeAndModel` (for display) and DPI (every `XResolution>NNN<`
+  value, deduped/sorted - see `update_dpi_options_from_capabilities()`)
+  come from the real response; a successful query silently ignoring
+  the requested resolution and substituting its own default is exactly
+  the failure this was added for. Source/Colour/Format/Size are still a
+  fixed guess, not scoped per-source (Platen vs Adf can support
+  different resolutions; this offers the union of both) - a scanner
+  could still reject one of those.
 - **No saved multi-scanner profiles yet** (MintPRINT's Unit0-7 switcher)
   - just a single `ENV:MintSCAN/Unit0`.
 

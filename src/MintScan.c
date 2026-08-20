@@ -46,6 +46,7 @@ typedef long ssize_t;
 #define GAD_QUERY_BUTTON     14
 
 #define MAX_DISCOVERY_RESULTS 16
+#define MAX_DPI_OPTIONS 10
 #define MAX_BUFFER    65536   /* capabilities / ScanJobs response scratch */
 #define MAX_OUTPUT_LINES 8
 #define MAX_OUTPUT_LINE_LENGTH 55
@@ -81,8 +82,16 @@ static const char *source_values[] = { "Platen", "Feeder" };
 static STRPTR color_labels[] = { (STRPTR)"Colour", (STRPTR)"Grayscale", (STRPTR)"Black & White", NULL };
 static const char *color_values[] = { "RGB24", "Grayscale8", "BlackAndWhite1" };
 
-static STRPTR dpi_labels[] = { (STRPTR)"100", (STRPTR)"150", (STRPTR)"200", (STRPTR)"300", (STRPTR)"600", NULL };
-static const int dpi_values[] = { 100, 150, 200, 300, 600 };
+/* DPI options start as this fixed guess, but get replaced with whatever
+   the scanner actually advertises in ScannerCapabilities the first time
+   a query succeeds - see update_dpi_options_from_capabilities(). Several
+   real eSCL scanners (Brother's included) silently substitute their own
+   default resolution rather than erroring when asked for one they don't
+   support, so offering only what's actually supported matters. */
+static int dpi_option_values[MAX_DPI_OPTIONS] = { 100, 150, 200, 300, 600 };
+static int dpi_option_count = 5;
+static char dpi_option_storage[MAX_DPI_OPTIONS][8];
+static STRPTR dpi_option_labels[MAX_DPI_OPTIONS + 1];
 
 static STRPTR format_labels[] = { (STRPTR)"JPEG", (STRPTR)"PNG", (STRPTR)"PDF", NULL };
 static const char *format_mimes[] = { "image/jpeg", "image/png", "application/pdf" };
@@ -267,7 +276,7 @@ static BOOL write_config_file(CONST_STRPTR filename) {
     FPuts(file, (STRPTR)line);
     snprintf(line, sizeof(line), "COLORMODE=%s\n", color_values[color_index]);
     FPuts(file, (STRPTR)line);
-    snprintf(line, sizeof(line), "RESOLUTION=%d\n", dpi_values[dpi_index]);
+    snprintf(line, sizeof(line), "RESOLUTION=%d\n", dpi_option_values[dpi_index]);
     FPuts(file, (STRPTR)line);
     snprintf(line, sizeof(line), "FORMAT=%s\n", format_mimes[format_index]);
     FPuts(file, (STRPTR)line);
@@ -329,8 +338,8 @@ static void load_config(void) {
             if (idx >= 0) color_index = idx;
         } else if (strncmp(line, "RESOLUTION=", 11) == 0) {
             int r = atoi(line + 11);
-            for (idx = 0; idx < 5; idx++) {
-                if (dpi_values[idx] == r) { dpi_index = idx; break; }
+            for (idx = 0; idx < dpi_option_count; idx++) {
+                if (dpi_option_values[idx] == r) { dpi_index = idx; break; }
             }
         } else if (strncmp(line, "FORMAT=", 7) == 0) {
             idx = find_label_index(format_mimes, 3, line + 7);
@@ -487,6 +496,69 @@ static int mdns_discover_scanners(int count_io, int max_results, const char **la
     free(buf);
     CloseSocket(sockfd);
     return count;
+}
+
+static void rebuild_dpi_dropdown(void) {
+    int i;
+
+    for (i = 0; i < dpi_option_count; i++) {
+        snprintf(dpi_option_storage[i], sizeof(dpi_option_storage[i]), "%d", dpi_option_values[i]);
+        dpi_option_labels[i] = (STRPTR)dpi_option_storage[i];
+    }
+    dpi_option_labels[dpi_option_count] = NULL;
+    if (dpi_index >= dpi_option_count) dpi_index = 0;
+}
+
+/* Scrapes every "...XResolution>NNN</..." in a ScannerCapabilities
+   response - covering both Platen and Adf DiscreteResolutions - into a
+   sorted, deduplicated DPI option list. Not scoped to the currently
+   selected Source (that would need real element-nesting-aware XML
+   parsing); offering the union is the safer approximation. Leaves the
+   existing options untouched if the scanner doesn't advertise a
+   discrete list at all (e.g. only a resolution range), and tries to
+   keep whatever DPI was already selected - or the closest available
+   one - rather than silently resetting it. */
+static void update_dpi_options_from_capabilities(const char *xml) {
+    int values[MAX_DPI_OPTIONS];
+    int count = 0;
+    int current_dpi;
+    int i;
+    const char *p = xml;
+
+    current_dpi = (dpi_index < dpi_option_count) ? dpi_option_values[dpi_index] : 300;
+
+    while ((p = strstr(p, "XResolution>")) != NULL) {
+        int v;
+        p += 13; /* strlen("XResolution>") */
+        v = atoi(p);
+        if (v > 0) {
+            int dup = 0;
+            for (i = 0; i < count; i++) if (values[i] == v) { dup = 1; break; }
+            if (!dup && count < MAX_DPI_OPTIONS) values[count++] = v;
+        }
+    }
+
+    if (count == 0) return;
+
+    for (i = 1; i < count; i++) {
+        int key = values[i];
+        int j = i - 1;
+        while (j >= 0 && values[j] > key) { values[j + 1] = values[j]; j--; }
+        values[j + 1] = key;
+    }
+
+    for (i = 0; i < count; i++) dpi_option_values[i] = values[i];
+    dpi_option_count = count;
+
+    dpi_index = 0;
+    for (i = 0; i < count; i++) {
+        if (dpi_option_values[i] == current_dpi) { dpi_index = i; break; }
+        if (abs(dpi_option_values[i] - current_dpi) < abs(dpi_option_values[dpi_index] - current_dpi)) {
+            dpi_index = i;
+        }
+    }
+
+    rebuild_dpi_dropdown();
 }
 
 static void rebuild_scanner_dropdown(void) {
@@ -1027,6 +1099,8 @@ static void query_capabilities(const char *ip, int port) {
         }
     }
 
+    update_dpi_options_from_capabilities(response);
+
     have_capabilities = TRUE;
     if (scanner_make_model[0]) {
         printf("Found: %s\n", scanner_make_model);
@@ -1057,7 +1131,7 @@ static void build_scan_settings_xml(char *buf, int buf_size) {
         "</scan:ScanSettings>\n",
         size_height_300[size_index], size_width_300[size_index],
         source_values[source_index], color_values[color_index],
-        dpi_values[dpi_index], dpi_values[dpi_index],
+        dpi_option_values[dpi_index], dpi_option_values[dpi_index],
         format_mimes[format_index]);
 }
 
@@ -1126,6 +1200,7 @@ static void do_discover(void) {
 
 static struct Gadget *find_gadget_by_id(struct Window *win, int id);
 static struct Gadget *find_model_gadget(struct Window *win);
+static struct Gadget *find_dpi_gadget(struct Window *win);
 static void sync_string_gadget(struct Window *win, int gadget_id, char *dest, int dest_size);
 
 static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWORD topborder) {
@@ -1222,7 +1297,7 @@ static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWOR
     ng.ng_GadgetText = (STRPTR)"DPI:";
     ng.ng_GadgetID = GAD_DPI_DROPDOWN;
     gad = CreateGadget(CYCLE_KIND, gad, &ng,
-        GTCY_Labels, (ULONG)dpi_labels, GTCY_Active, dpi_index, TAG_DONE);
+        GTCY_Labels, (ULONG)dpi_option_labels, GTCY_Active, dpi_index, TAG_DONE);
     if (!gad) return NULL;
 
     ng.ng_TopEdge += 20;
@@ -1302,7 +1377,7 @@ static void process_window_events(struct Window *win) {
                         case GAD_SCANNER_DROPDOWN: {
                             if (!operation_in_progress) {
                                 ULONG selected = 0;
-                                struct Gadget *mg;
+                                struct Gadget *mg, *dg;
                                 operation_in_progress = TRUE;
                                 GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&selected, TAG_DONE);
                                 select_discovered_scanner((int)selected);
@@ -1312,13 +1387,19 @@ static void process_window_events(struct Window *win) {
                                     GT_SetGadgetAttrs(mg, win, NULL,
                                                        GTST_String, (ULONG)scanner_make_model, TAG_DONE);
                                 }
+                                dg = find_dpi_gadget(win);
+                                if (dg) {
+                                    GT_SetGadgetAttrs(dg, win, NULL,
+                                        GTCY_Labels, (ULONG)dpi_option_labels,
+                                        GTCY_Active, (ULONG)dpi_index, TAG_DONE);
+                                }
                                 operation_in_progress = FALSE;
                             }
                             break;
                         }
                         case GAD_DISCOVER_BUTTON:
                             if (!operation_in_progress) {
-                                struct Gadget *sg, *mg;
+                                struct Gadget *sg, *mg, *dg;
                                 operation_in_progress = TRUE;
                                 do_discover();
                                 sg = find_gadget_by_id(win, GAD_SCANNER_DROPDOWN);
@@ -1332,6 +1413,12 @@ static void process_window_events(struct Window *win) {
                                     GT_SetGadgetAttrs(mg, win, NULL,
                                                        GTST_String, (ULONG)scanner_make_model, TAG_DONE);
                                 }
+                                dg = find_dpi_gadget(win);
+                                if (dg) {
+                                    GT_SetGadgetAttrs(dg, win, NULL,
+                                        GTCY_Labels, (ULONG)dpi_option_labels,
+                                        GTCY_Active, (ULONG)dpi_index, TAG_DONE);
+                                }
                                 operation_in_progress = FALSE;
                             }
                             break;
@@ -1343,7 +1430,7 @@ static void process_window_events(struct Window *win) {
                                 sync_string_gadget(win, GAD_IP_STRING, ip_entry_buffer, sizeof(ip_entry_buffer));
                                 if (parse_host_port(ip_entry_buffer, host, sizeof(host), &port)) {
                                     int idx = add_or_select_manual_ip(host, port);
-                                    struct Gadget *sg, *mg;
+                                    struct Gadget *sg, *mg, *dg;
                                     query_capabilities(scanner_host, scanner_port);
                                     sg = find_gadget_by_id(win, GAD_SCANNER_DROPDOWN);
                                     if (sg) {
@@ -1355,6 +1442,12 @@ static void process_window_events(struct Window *win) {
                                     if (mg) {
                                         GT_SetGadgetAttrs(mg, win, NULL,
                                                            GTST_String, (ULONG)scanner_make_model, TAG_DONE);
+                                    }
+                                    dg = find_dpi_gadget(win);
+                                    if (dg) {
+                                        GT_SetGadgetAttrs(dg, win, NULL,
+                                            GTCY_Labels, (ULONG)dpi_option_labels,
+                                            GTCY_Active, (ULONG)dpi_index, TAG_DONE);
                                     }
                                 } else {
                                     printf("Enter a scanner IP first\n");
@@ -1447,6 +1540,10 @@ static struct Gadget *find_model_gadget(struct Window *win) {
     return find_gadget_by_id(win, GAD_MODEL_DISPLAY);
 }
 
+static struct Gadget *find_dpi_gadget(struct Window *win) {
+    return find_gadget_by_id(win, GAD_DPI_DROPDOWN);
+}
+
 /* GTST_String only sets a string gadget's INITIAL text at creation time -
    GadTools keeps its own internal edit buffer after that, so live typing
    never touches the buffer we passed in. GT_GetGadgetAttrs(..., GTST_String,
@@ -1522,6 +1619,7 @@ int main(void) {
 
     load_config();
     rebuild_scanner_dropdown();
+    rebuild_dpi_dropdown();
     if (scanner_host[0]) {
         if (scanner_port != 80) {
             snprintf(ip_entry_buffer, sizeof(ip_entry_buffer), "%s:%d", scanner_host, scanner_port);
