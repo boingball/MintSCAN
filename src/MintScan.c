@@ -1,0 +1,1309 @@
+/* MintSCAN - eSCL (AirScan/AirPrint Scan) scanning for classic AmigaOS.
+   Discovers eSCL scanners on the LAN (mDNS), queries ScannerCapabilities,
+   and scans a single page straight to a file via ScanJobs/NextDocument.
+
+   Sibling project to MintPRINT - same bsdsocket/GadTools idioms, but a
+   plain application (no printer.device-style driver: there is no
+   AmigaOS device abstraction for scanners to hook into). See
+   docs/ARCHITECTURE.md for the eSCL flow and known limitations. */
+
+#include <proto/exec.h>
+#include <proto/dos.h>
+#include <dos/dos.h>
+#include <proto/intuition.h>
+#include <proto/gadtools.h>
+#include <proto/graphics.h>
+typedef long ssize_t;
+#include <clib/alib_protos.h>
+#include <proto/bsdsocket.h>
+#include <intuition/intuition.h>
+#include <intuition/gadgetclass.h>
+#include <libraries/gadtools.h>
+#include <graphics/gfx.h>
+#include <graphics/rastport.h>
+#include <stdarg.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* --------------------------------------------------------------------
+ * Constants, gadget IDs, globals
+ * ----------------------------------------------------------------- */
+
+#define GAD_SCANNER_DROPDOWN 1
+#define GAD_DISCOVER_BUTTON  2
+#define GAD_MODEL_DISPLAY    3
+#define GAD_SOURCE_DROPDOWN  4
+#define GAD_COLOR_DROPDOWN   5
+#define GAD_DPI_DROPDOWN     6
+#define GAD_FORMAT_DROPDOWN  7
+#define GAD_SIZE_DROPDOWN    8
+#define GAD_SAVEPATH_STRING  9
+#define GAD_SCAN_BUTTON      10
+#define GAD_SAVE_BUTTON      11
+#define GAD_EXIT_BUTTON      12
+
+#define MAX_DISCOVERY_RESULTS 16
+#define MAX_BUFFER    65536   /* capabilities / ScanJobs response scratch */
+#define MAX_OUTPUT_LINES 8
+#define MAX_OUTPUT_LINE_LENGTH 55
+#define OUTPUT_TOP    225
+#define OUTPUT_LEFT   10
+#define OUTPUT_LINE_H 10
+#define OUTPUT_RIGHT  (window->Width - 20)
+
+struct DiscoveredScanner {
+    char ip[16];
+    char label[80];
+};
+
+static struct DiscoveredScanner discovered[MAX_DISCOVERY_RESULTS];
+static int discovered_count = 0;
+static STRPTR scanner_label_ptrs[MAX_DISCOVERY_RESULTS + 1];
+static char scanner_label_storage[MAX_DISCOVERY_RESULTS][80];
+static STRPTR *scanner_dropdown_labels = NULL;
+
+/* The scanner currently selected in the GUI - may come from discovery,
+   or from a saved profile loaded at startup before any Discover click. */
+static char scanner_host[64] = "";
+static int  scanner_port = 80;
+static char scanner_make_model[96] = "";
+static BOOL have_capabilities = FALSE;
+
+/* Option tables. Labels are what GadTools shows; the parallel array is
+   what actually goes into the eSCL request. Kept as a fixed set rather
+   than parsed from ScannerCapabilities - see docs/ARCHITECTURE.md. */
+static STRPTR source_labels[] = { (STRPTR)"Flatbed", (STRPTR)"Feeder (ADF)", NULL };
+static const char *source_values[] = { "Platen", "Feeder" };
+
+static STRPTR color_labels[] = { (STRPTR)"Colour", (STRPTR)"Grayscale", (STRPTR)"Black & White", NULL };
+static const char *color_values[] = { "RGB24", "Grayscale8", "BlackAndWhite1" };
+
+static STRPTR dpi_labels[] = { (STRPTR)"100", (STRPTR)"150", (STRPTR)"200", (STRPTR)"300", (STRPTR)"600", NULL };
+static const int dpi_values[] = { 100, 150, 200, 300, 600 };
+
+static STRPTR format_labels[] = { (STRPTR)"JPEG", (STRPTR)"PNG", (STRPTR)"PDF", NULL };
+static const char *format_mimes[] = { "image/jpeg", "image/png", "application/pdf" };
+
+/* Region sizes in eSCL's units: hundredths of an inch at 300 units/inch
+   regardless of scan resolution (per the eSCL spec's ScanRegions). */
+static STRPTR size_labels[] = { (STRPTR)"A4", (STRPTR)"Letter", (STRPTR)"Legal", NULL };
+static const int size_width_300[]  = { 2480, 2550, 2550 };
+static const int size_height_300[] = { 3507, 3300, 4200 };
+
+static int source_index = 0;
+static int color_index = 0;
+static int dpi_index = 3;   /* 300 dpi */
+static int format_index = 0; /* JPEG */
+static int size_index = 0;  /* A4 */
+
+static char savepath_buffer[256] = "RAM:scan001.jpg";
+
+static char output_buffer[MAX_OUTPUT_LINES][MAX_OUTPUT_LINE_LENGTH];
+static int output_line = 0;
+
+static struct Window *window = NULL;
+static struct Gadget *glist = NULL;
+static struct Screen *screen = NULL;
+static void *vi = NULL;
+static struct TextFont *font = NULL;
+static struct Library *SocketBase = NULL;
+static struct Library *GadToolsBase = NULL;
+static struct IntuitionBase *IntuitionBase = NULL;
+static struct GfxBase *GfxBase = NULL;
+static BOOL operation_in_progress = FALSE;
+
+static struct TextAttr Topaz80 = { (STRPTR)"topaz.font", 8, 0, 0 };
+static struct TextAttr Topaz60 = { (STRPTR)"topaz.font", 6, 0, 0 };
+
+/* status/progress output goes to the on-screen box, never a console -
+   this may be launched from Workbench, where there is no console. */
+static void custom_printf(const char *format, ...);
+#define printf custom_printf
+
+/* --------------------------------------------------------------------
+ * Status output box
+ * ----------------------------------------------------------------- */
+
+static void redraw_output_box(void) {
+    struct RastPort *rp;
+    int line_height, top, bottom, start_line, i;
+
+    if (!window) return;
+
+    rp = window->RPort;
+    if (font) SetFont(rp, font);
+    SetAPen(rp, 1);
+    SetBPen(rp, 0);
+    SetDrMd(rp, JAM2);
+
+    line_height = font->tf_YSize + 2;
+    top = OUTPUT_TOP;
+    bottom = top + (MAX_OUTPUT_LINES * line_height) - 1;
+
+    SetAPen(rp, 1);
+    RectFill(rp, OUTPUT_LEFT - 2, top - 2, OUTPUT_RIGHT + 2, top - 1);
+    RectFill(rp, OUTPUT_LEFT - 2, bottom + 1, OUTPUT_RIGHT + 2, bottom + 2);
+    RectFill(rp, OUTPUT_LEFT - 2, top - 2, OUTPUT_LEFT - 1, bottom + 2);
+    RectFill(rp, OUTPUT_RIGHT + 1, top - 2, OUTPUT_RIGHT + 2, bottom + 2);
+
+    SetAPen(rp, 0);
+    RectFill(rp, OUTPUT_LEFT, top, OUTPUT_RIGHT, bottom);
+
+    start_line = (output_line > MAX_OUTPUT_LINES) ? (output_line - MAX_OUTPUT_LINES) : 0;
+    for (i = 0; i < MAX_OUTPUT_LINES && (start_line + i) < output_line; i++) {
+        int y = top + (i * line_height) + font->tf_Baseline;
+        Move(rp, OUTPUT_LEFT, y);
+        SetAPen(rp, 1);
+        Text(rp, output_buffer[start_line + i], strlen(output_buffer[start_line + i]));
+    }
+}
+
+static void custom_printf(const char *format, ...) {
+    va_list args;
+    char temp[256];
+    size_t len;
+    int i;
+
+    if (strcmp(format, "CLEAR") == 0) {
+        output_line = 0;
+        redraw_output_box();
+        return;
+    }
+
+    va_start(args, format);
+    vsnprintf(temp, sizeof(temp), format, args);
+    va_end(args);
+
+    len = strlen(temp);
+    if (len > 0 && temp[len - 1] == '\n') {
+        temp[len - 1] = '\0';
+    }
+
+    if (output_line >= MAX_OUTPUT_LINES) {
+        for (i = 0; i < MAX_OUTPUT_LINES - 1; i++) {
+            strncpy(output_buffer[i], output_buffer[i + 1], MAX_OUTPUT_LINE_LENGTH);
+        }
+        output_line = MAX_OUTPUT_LINES - 1;
+    }
+
+    strncpy(output_buffer[output_line], temp, MAX_OUTPUT_LINE_LENGTH - 1);
+    output_buffer[output_line][MAX_OUTPUT_LINE_LENGTH - 1] = '\0';
+    output_line++;
+
+    redraw_output_box();
+}
+
+/* Drains pending GUI events without acting on them - called from inside
+   blocking network loops so the window stays responsive (repaints,
+   moves) while a discovery poll or HTTP request is in flight. */
+static void drain_gui_events(void) {
+    if (window) {
+        struct IntuiMessage *imsg;
+        while ((imsg = GT_GetIMsg(window->UserPort))) {
+            GT_ReplyIMsg(imsg);
+        }
+    }
+}
+
+/* --------------------------------------------------------------------
+ * Saved profile: ENV:MintSCAN/Unit0 (and ENVARC: for persistence)
+ * ----------------------------------------------------------------- */
+
+static void trim_config_line(char *s) {
+    size_t n;
+    if (!s) return;
+    n = strlen(s);
+    while (n && (s[n - 1] == '\r' || s[n - 1] == '\n' ||
+                 s[n - 1] == ' ' || s[n - 1] == '\t')) {
+        s[--n] = '\0';
+    }
+}
+
+static BOOL ensure_config_dir(CONST_STRPTR name) {
+    BPTR lock = Lock(name, ACCESS_READ);
+    if (lock) { UnLock(lock); return TRUE; }
+    lock = CreateDir(name);
+    if (!lock) return FALSE;
+    UnLock(lock);
+    return TRUE;
+}
+
+static int find_label_index(const char **values, int count, const char *value) {
+    int i;
+    for (i = 0; i < count; i++) {
+        if (strcmp(values[i], value) == 0) return i;
+    }
+    return -1;
+}
+
+static BOOL write_config_file(CONST_STRPTR filename) {
+    BPTR file;
+    char line[256];
+
+    file = Open(filename, MODE_NEWFILE);
+    if (!file) return FALSE;
+
+    FPuts(file, (STRPTR)"# MintSCAN Unit0 - written by MintScan\n");
+    snprintf(line, sizeof(line), "HOST=%s\n", scanner_host);
+    FPuts(file, (STRPTR)line);
+    snprintf(line, sizeof(line), "PORT=%d\n", scanner_port);
+    FPuts(file, (STRPTR)line);
+    snprintf(line, sizeof(line), "MODEL=%s\n", scanner_make_model);
+    FPuts(file, (STRPTR)line);
+    snprintf(line, sizeof(line), "SOURCE=%s\n", source_values[source_index]);
+    FPuts(file, (STRPTR)line);
+    snprintf(line, sizeof(line), "COLORMODE=%s\n", color_values[color_index]);
+    FPuts(file, (STRPTR)line);
+    snprintf(line, sizeof(line), "RESOLUTION=%d\n", dpi_values[dpi_index]);
+    FPuts(file, (STRPTR)line);
+    snprintf(line, sizeof(line), "FORMAT=%s\n", format_mimes[format_index]);
+    FPuts(file, (STRPTR)line);
+    snprintf(line, sizeof(line), "PAGESIZE=%s\n", (char *)size_labels[size_index]);
+    FPuts(file, (STRPTR)line);
+    snprintf(line, sizeof(line), "SAVEPATH=%s\n", savepath_buffer);
+    FPuts(file, (STRPTR)line);
+
+    Close(file);
+    return TRUE;
+}
+
+static BOOL save_config(void) {
+    BOOL env_ok, envarc_ok;
+
+    if (!ensure_config_dir((CONST_STRPTR)"ENV:MintSCAN")) {
+        printf("Could not create ENV:MintSCAN\n");
+        return FALSE;
+    }
+    if (!ensure_config_dir((CONST_STRPTR)"ENVARC:MintSCAN")) {
+        printf("Could not create ENVARC:MintSCAN\n");
+        return FALSE;
+    }
+
+    env_ok = write_config_file((CONST_STRPTR)"ENV:MintSCAN/Unit0");
+    envarc_ok = write_config_file((CONST_STRPTR)"ENVARC:MintSCAN/Unit0");
+    return env_ok && envarc_ok;
+}
+
+static void load_config(void) {
+    BPTR file;
+    char line[256];
+    int idx;
+
+    file = Open((CONST_STRPTR)"ENV:MintSCAN/Unit0", MODE_OLDFILE);
+    if (!file) file = Open((CONST_STRPTR)"ENVARC:MintSCAN/Unit0", MODE_OLDFILE);
+    if (!file) return;
+
+    while (FGets(file, line, sizeof(line))) {
+        char *value;
+        trim_config_line(line);
+        if (!line[0] || line[0] == '#') continue;
+
+        if (strncmp(line, "HOST=", 5) == 0) {
+            value = line + 5;
+            strncpy(scanner_host, value, sizeof(scanner_host) - 1);
+            scanner_host[sizeof(scanner_host) - 1] = '\0';
+        } else if (strncmp(line, "PORT=", 5) == 0) {
+            int p = atoi(line + 5);
+            if (p >= 1 && p <= 65535) scanner_port = p;
+        } else if (strncmp(line, "MODEL=", 6) == 0) {
+            strncpy(scanner_make_model, line + 6, sizeof(scanner_make_model) - 1);
+            scanner_make_model[sizeof(scanner_make_model) - 1] = '\0';
+        } else if (strncmp(line, "SOURCE=", 7) == 0) {
+            idx = find_label_index(source_values, 2, line + 7);
+            if (idx >= 0) source_index = idx;
+        } else if (strncmp(line, "COLORMODE=", 10) == 0) {
+            idx = find_label_index(color_values, 3, line + 10);
+            if (idx >= 0) color_index = idx;
+        } else if (strncmp(line, "RESOLUTION=", 11) == 0) {
+            int r = atoi(line + 11);
+            for (idx = 0; idx < 5; idx++) {
+                if (dpi_values[idx] == r) { dpi_index = idx; break; }
+            }
+        } else if (strncmp(line, "FORMAT=", 7) == 0) {
+            idx = find_label_index(format_mimes, 3, line + 7);
+            if (idx >= 0) format_index = idx;
+        } else if (strncmp(line, "PAGESIZE=", 9) == 0) {
+            for (idx = 0; idx < 3; idx++) {
+                if (strcmp((char *)size_labels[idx], line + 9) == 0) { size_index = idx; break; }
+            }
+        } else if (strncmp(line, "SAVEPATH=", 9) == 0) {
+            strncpy(savepath_buffer, line + 9, sizeof(savepath_buffer) - 1);
+            savepath_buffer[sizeof(savepath_buffer) - 1] = '\0';
+        }
+    }
+    Close(file);
+
+    if (scanner_host[0]) {
+        strncpy(discovered[0].ip, scanner_host, sizeof(discovered[0].ip) - 1);
+        discovered[0].ip[sizeof(discovered[0].ip) - 1] = '\0';
+        if (scanner_make_model[0]) {
+            snprintf(discovered[0].label, sizeof(discovered[0].label),
+                     "%s (%s)", scanner_host, scanner_make_model);
+        } else {
+            snprintf(discovered[0].label, sizeof(discovered[0].label),
+                     "%s (saved)", scanner_host);
+        }
+        discovered_count = 1;
+    }
+}
+
+/* --------------------------------------------------------------------
+ * LAN scanner discovery (mDNS / Bonjour / AirScan)
+ *
+ * Same shape as MintPRINT's mDNS printer discovery: a hand-built DNS PTR
+ * query with the "QU" unicast-response bit set, so this never needs to
+ * join the 224.0.0.251 multicast group to see replies. Deliberately does
+ * not decode SRV/TXT records - a reply's source address is enough to
+ * populate the picker; ScannerCapabilities after selection supplies the
+ * real details. Queries both _uscan._tcp (eSCL/HTTP, the common case)
+ * and _uscans._tcp (eSCL/HTTPS - discovered here, but not yet reachable,
+ * see docs/ARCHITECTURE.md).
+ * ----------------------------------------------------------------- */
+
+static BOOL discovery_ip_seen(int count, const char *ip) {
+    int i;
+    for (i = 0; i < count; i++) {
+        if (strcmp(discovered[i].ip, ip) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+static int build_mdns_ptr_query(unsigned char *buf, int buf_size, const char **labels) {
+    static const unsigned char header[12] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    int off, i;
+
+    if (buf_size < 40) return 0;
+
+    memcpy(buf, header, sizeof(header));
+    off = sizeof(header);
+
+    for (i = 0; labels[i]; i++) {
+        int len = (int)strlen(labels[i]);
+        buf[off++] = (unsigned char)len;
+        memcpy(buf + off, labels[i], len);
+        off += len;
+    }
+    buf[off++] = 0x00;
+
+    buf[off++] = 0x00; buf[off++] = 0x0C; /* QTYPE = PTR */
+    buf[off++] = 0x80; buf[off++] = 0x01; /* QCLASS = IN, QU bit set */
+
+    return off;
+}
+
+static int mdns_discover_scanners(int count_io, int max_results, const char **labels,
+                                   const char *tag) {
+    int sockfd;
+    struct sockaddr_in dest;
+    unsigned char query[64];
+    int query_len;
+    char *buf;
+    int count = count_io;
+    int poll_num;
+    const int max_polls = 10; /* ~500ms per poll => ~5s total scan time */
+
+    if (count >= max_results) return count;
+
+    query_len = build_mdns_ptr_query(query, sizeof(query), labels);
+    if (query_len <= 0) return count;
+
+    sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sockfd < 0) {
+        printf("Discovery: could not create mDNS socket\n");
+        return count;
+    }
+
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(5353);
+    dest.sin_addr.s_addr = inet_addr((STRPTR)"224.0.0.251");
+
+    if (sendto(sockfd, (char *)query, query_len, 0,
+               (struct sockaddr *)&dest, sizeof(dest)) < 0) {
+        printf("Discovery: mDNS send failed (no route to 224.0.0.251?)\n");
+        CloseSocket(sockfd);
+        return count;
+    }
+
+    buf = malloc(1024);
+    if (!buf) { CloseSocket(sockfd); return count; }
+
+    for (poll_num = 0; poll_num < max_polls && count < max_results; poll_num++) {
+        fd_set readfds;
+        struct timeval tv;
+        long ready;
+        struct sockaddr_in from;
+        socklen_t fromlen;
+        ssize_t received;
+
+        drain_gui_events();
+
+        FD_ZERO(&readfds);
+        FD_SET(sockfd, &readfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 500000;
+        ready = WaitSelect(sockfd + 1, &readfds, NULL, NULL, &tv, NULL);
+        if (ready <= 0) continue;
+
+        fromlen = sizeof(from);
+        memset(&from, 0, sizeof(from));
+        received = recvfrom(sockfd, buf, 1023, 0, (struct sockaddr *)&from, &fromlen);
+        if (received < 12 || from.sin_port != htons(5353)) continue;
+        if (buf[6] == 0 && buf[7] == 0) continue; /* ANCOUNT == 0 */
+
+        {
+            char ipstr[16];
+            const unsigned char *b = (const unsigned char *)&from.sin_addr;
+
+            snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+            if (b[0] == 127) continue;
+
+            if (!discovery_ip_seen(count, ipstr)) {
+                strncpy(discovered[count].ip, ipstr, sizeof(discovered[count].ip) - 1);
+                discovered[count].ip[sizeof(discovered[count].ip) - 1] = '\0';
+                snprintf(discovered[count].label, sizeof(discovered[count].label),
+                         "%s (%s)", ipstr, tag);
+                printf("Discovery: found %s\n", discovered[count].label);
+                count++;
+            }
+        }
+    }
+
+    free(buf);
+    CloseSocket(sockfd);
+    return count;
+}
+
+static void rebuild_scanner_dropdown(void) {
+    int i;
+    static const char *unset_label = "(none found)";
+
+    for (i = 0; i < discovered_count && i < MAX_DISCOVERY_RESULTS; i++) {
+        strncpy(scanner_label_storage[i], discovered[i].label, sizeof(scanner_label_storage[i]) - 1);
+        scanner_label_storage[i][sizeof(scanner_label_storage[i]) - 1] = '\0';
+        scanner_label_ptrs[i] = scanner_label_storage[i];
+    }
+    if (discovered_count == 0) {
+        strncpy(scanner_label_storage[0], unset_label, sizeof(scanner_label_storage[0]) - 1);
+        scanner_label_ptrs[0] = scanner_label_storage[0];
+        scanner_label_ptrs[1] = NULL;
+    } else {
+        scanner_label_ptrs[discovered_count] = NULL;
+    }
+    scanner_dropdown_labels = scanner_label_ptrs;
+}
+
+static void select_discovered_scanner(int idx) {
+    if (idx < 0 || idx >= discovered_count) return;
+    strncpy(scanner_host, discovered[idx].ip, sizeof(scanner_host) - 1);
+    scanner_host[sizeof(scanner_host) - 1] = '\0';
+    scanner_port = 80;
+}
+
+/* --------------------------------------------------------------------
+ * HTTP over bsdsocket - shared by ScannerCapabilities, ScanJobs and
+ * NextDocument. Text requests/responses only; see download_next_document
+ * for the streaming-to-file variant used for the scanned image itself.
+ * ----------------------------------------------------------------- */
+
+static int http_connect(const char *ip, int port) {
+    int sockfd;
+    struct sockaddr_in serv_addr;
+    struct timeval timeout = { 8, 0 };
+
+    sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sockfd < 0) return -1;
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) < 0) {
+        CloseSocket(sockfd);
+        return -1;
+    }
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(port);
+    serv_addr.sin_addr.s_addr = inet_addr((STRPTR)ip);
+    if (serv_addr.sin_addr.s_addr == INADDR_NONE) {
+        CloseSocket(sockfd);
+        return -1;
+    }
+
+    drain_gui_events();
+    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        CloseSocket(sockfd);
+        return -1;
+    }
+    return sockfd;
+}
+
+/* GET request. On success returns the HTTP status code and leaves the
+   response body (headers stripped) in response[]. */
+static int http_get(const char *ip, int port, const char *path,
+                     char *response, int maxlen) {
+    int sockfd;
+    char header[512];
+    int total = 0;
+    char *body;
+    int status = -1;
+
+    sockfd = http_connect(ip, port);
+    if (sockfd < 0) {
+        printf("Connect failed: %s:%d\n", ip, port);
+        return -1;
+    }
+
+    snprintf(header, sizeof(header),
+             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, ip);
+
+    if (send(sockfd, header, strlen(header), 0) < 0) {
+        CloseSocket(sockfd);
+        return -1;
+    }
+
+    while (total < maxlen - 1) {
+        drain_gui_events();
+        ssize_t received = recv(sockfd, response + total, maxlen - 1 - total, 0);
+        if (received > 0) {
+            total += received;
+            response[total] = '\0';
+        } else {
+            break; /* connection closed, or a real error - either way, done */
+        }
+    }
+    CloseSocket(sockfd);
+
+    if (total == 0) return -1;
+    response[total] = '\0';
+
+    sscanf(response, "HTTP/%*d.%*d %d", &status);
+    body = strstr(response, "\r\n\r\n");
+    if (body) {
+        body += 4;
+        memmove(response, body, strlen(body) + 1);
+    }
+    return status;
+}
+
+/* POST with an XML body. On success (201 Created for ScanJobs) fills in
+   location[] from the response's Location header. */
+static int http_post_xml(const char *ip, int port, const char *path,
+                          const char *body_in, char *location, int location_size) {
+    int sockfd;
+    char header[512];
+    char response[2048];
+    int total = 0;
+    int status = -1;
+    char *loc_hdr;
+
+    sockfd = http_connect(ip, port);
+    if (sockfd < 0) {
+        printf("Connect failed: %s:%d\n", ip, port);
+        return -1;
+    }
+
+    snprintf(header, sizeof(header),
+             "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: text/xml\r\n"
+             "Content-Length: %d\r\nConnection: close\r\n\r\n",
+             path, ip, (int)strlen(body_in));
+
+    if (send(sockfd, header, strlen(header), 0) < 0 ||
+        send(sockfd, body_in, strlen(body_in), 0) < 0) {
+        CloseSocket(sockfd);
+        return -1;
+    }
+
+    while (total < (int)sizeof(response) - 1) {
+        drain_gui_events();
+        ssize_t received = recv(sockfd, response + total, sizeof(response) - 1 - total, 0);
+        if (received > 0) {
+            total += received;
+            response[total] = '\0';
+            if (strstr(response, "\r\n\r\n")) break; /* don't need the body here */
+        } else {
+            break;
+        }
+    }
+    CloseSocket(sockfd);
+
+    if (total == 0) return -1;
+    response[total] = '\0';
+    sscanf(response, "HTTP/%*d.%*d %d", &status);
+
+    location[0] = '\0';
+    loc_hdr = strstr(response, "Location:");
+    if (!loc_hdr) loc_hdr = strstr(response, "location:");
+    if (loc_hdr) {
+        char *end;
+        loc_hdr += 9;
+        while (*loc_hdr == ' ') loc_hdr++;
+        end = strstr(loc_hdr, "\r\n");
+        if (end) {
+            int len = (int)(end - loc_hdr);
+            if (len >= location_size) len = location_size - 1;
+            memcpy(location, loc_hdr, len);
+            location[len] = '\0';
+        }
+    }
+    return status;
+}
+
+/* Best-effort job cleanup - failure here is not fatal, most scanners
+   expire an unclaimed job on their own after a timeout. */
+static void http_delete(const char *ip, int port, const char *path) {
+    int sockfd;
+    char header[512];
+    char discard[256];
+
+    sockfd = http_connect(ip, port);
+    if (sockfd < 0) return;
+
+    snprintf(header, sizeof(header),
+             "DELETE %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, ip);
+    send(sockfd, header, strlen(header), 0);
+    while (recv(sockfd, discard, sizeof(discard), 0) > 0) { /* drain */ }
+    CloseSocket(sockfd);
+}
+
+/* Strips a possible "http://host[:port]" prefix off a Location header
+   value, leaving just the path - scanners are inconsistent about
+   returning an absolute URL vs. a bare path here. */
+static void normalize_location_path(const char *location, char *path_out, int path_size) {
+    const char *p = location;
+    if (strncmp(p, "http://", 7) == 0) {
+        p += 7;
+        p = strchr(p, '/');
+        if (!p) p = "/";
+    } else if (strncmp(p, "https://", 8) == 0) {
+        p += 8;
+        p = strchr(p, '/');
+        if (!p) p = "/";
+    }
+    strncpy(path_out, p, path_size - 1);
+    path_out[path_size - 1] = '\0';
+}
+
+/* Downloads NextDocument straight to disk, splitting the HTTP header
+   from the binary body as bytes arrive rather than buffering the whole
+   image in memory first. Honours Content-Length when the server sends
+   one; otherwise reads until the connection closes. Does NOT handle
+   Transfer-Encoding: chunked yet - see docs/ARCHITECTURE.md. */
+static BOOL download_next_document(const char *ip, int port, const char *job_path,
+                                    const char *save_path, long *bytes_out) {
+    int sockfd;
+    char header[512];
+    char chunk[4096];
+    char headbuf[2048];
+    int headlen = 0;
+    BOOL header_done = FALSE;
+    long content_length = -1;
+    long written = 0;
+    BPTR outfile;
+    int status = -1;
+
+    sockfd = http_connect(ip, port);
+    if (sockfd < 0) {
+        printf("Connect failed for NextDocument\n");
+        return FALSE;
+    }
+
+    snprintf(header, sizeof(header),
+             "GET %s/NextDocument HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+             job_path, ip);
+    if (send(sockfd, header, strlen(header), 0) < 0) {
+        CloseSocket(sockfd);
+        return FALSE;
+    }
+
+    outfile = Open((CONST_STRPTR)save_path, MODE_NEWFILE);
+    if (!outfile) {
+        printf("Could not create %s\n", save_path);
+        CloseSocket(sockfd);
+        return FALSE;
+    }
+
+    for (;;) {
+        ssize_t received;
+        drain_gui_events();
+        received = recv(sockfd, chunk, sizeof(chunk), 0);
+        if (received <= 0) break;
+
+        if (!header_done) {
+            int copy = (int)received;
+            char *term;
+
+            if (headlen + copy > (int)sizeof(headbuf) - 1) {
+                copy = (int)sizeof(headbuf) - 1 - headlen;
+            }
+            memcpy(headbuf + headlen, chunk, copy);
+            headlen += copy;
+            headbuf[headlen] = '\0';
+
+            term = strstr(headbuf, "\r\n\r\n");
+            if (term) {
+                char *cl;
+                int header_bytes = (int)(term - headbuf) + 4;
+                int body_in_chunk = (int)received - (header_bytes - (headlen - copy));
+
+                sscanf(headbuf, "HTTP/%*d.%*d %d", &status);
+                cl = strstr(headbuf, "Content-Length:");
+                if (!cl) cl = strstr(headbuf, "content-length:");
+                if (cl) {
+                    cl += 15; /* strlen("Content-Length:") */
+                    while (*cl == ' ') cl++;
+                    content_length = atol(cl);
+                }
+
+                header_done = TRUE;
+
+                if (status != 200) {
+                    printf("NextDocument returned status %d\n", status);
+                    Close(outfile);
+                    DeleteFile((CONST_STRPTR)save_path);
+                    CloseSocket(sockfd);
+                    return FALSE;
+                }
+
+                if (body_in_chunk > 0) {
+                    Write(outfile, chunk + (received - body_in_chunk), body_in_chunk);
+                    written += body_in_chunk;
+                }
+            }
+        } else {
+            Write(outfile, chunk, received);
+            written += received;
+        }
+
+        if (content_length >= 0 && written >= content_length) break;
+    }
+
+    Close(outfile);
+    CloseSocket(sockfd);
+
+    if (!header_done) {
+        printf("NextDocument: no response\n");
+        return FALSE;
+    }
+
+    *bytes_out = written;
+    return TRUE;
+}
+
+/* --------------------------------------------------------------------
+ * eSCL protocol calls
+ * ----------------------------------------------------------------- */
+
+static void query_capabilities(const char *ip, int port) {
+    static char response[MAX_BUFFER];
+    int status;
+    char *tag, *end;
+
+    printf("Querying capabilities: %s:%d\n", ip, port);
+    status = http_get(ip, port, "/eSCL/ScannerCapabilities", response, sizeof(response));
+    if (status != 200) {
+        printf("ScannerCapabilities failed (status %d)\n", status);
+        have_capabilities = FALSE;
+        return;
+    }
+
+    scanner_make_model[0] = '\0';
+    tag = strstr(response, "MakeAndModel>");
+    if (tag) {
+        tag += 13;
+        end = strstr(tag, "</");
+        if (end) {
+            int len = (int)(end - tag);
+            if (len >= (int)sizeof(scanner_make_model)) len = sizeof(scanner_make_model) - 1;
+            memcpy(scanner_make_model, tag, len);
+            scanner_make_model[len] = '\0';
+        }
+    }
+
+    have_capabilities = TRUE;
+    if (scanner_make_model[0]) {
+        printf("Found: %s\n", scanner_make_model);
+    } else {
+        printf("Capabilities OK (model name not found in response)\n");
+    }
+}
+
+static void build_scan_settings_xml(char *buf, int buf_size) {
+    snprintf(buf, buf_size,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<scan:ScanSettings xmlns:scan=\"http://schemas.hp.com/imaging/escl/2011/05/03\" "
+        "xmlns:pwg=\"http://www.pwg.org/schemas/2010/12/sm\">\n"
+        "<pwg:Version>2.0</pwg:Version>\n"
+        "<pwg:ScanRegions>\n"
+        "<pwg:ScanRegion>\n"
+        "<pwg:Height>%d</pwg:Height>\n"
+        "<pwg:Width>%d</pwg:Width>\n"
+        "<pwg:XOffset>0</pwg:XOffset>\n"
+        "<pwg:YOffset>0</pwg:YOffset>\n"
+        "</pwg:ScanRegion>\n"
+        "</pwg:ScanRegions>\n"
+        "<pwg:InputSource>%s</pwg:InputSource>\n"
+        "<scan:ColorMode>%s</scan:ColorMode>\n"
+        "<scan:XResolution>%d</scan:XResolution>\n"
+        "<scan:YResolution>%d</scan:YResolution>\n"
+        "<pwg:DocumentFormat>%s</pwg:DocumentFormat>\n"
+        "</scan:ScanSettings>\n",
+        size_height_300[size_index], size_width_300[size_index],
+        source_values[source_index], color_values[color_index],
+        dpi_values[dpi_index], dpi_values[dpi_index],
+        format_mimes[format_index]);
+}
+
+static void do_scan(void) {
+    char xml[1024];
+    char location[256];
+    char job_path[256];
+    long bytes_written = 0;
+    int status;
+
+    if (!scanner_host[0]) {
+        printf("No scanner selected - use Discover first\n");
+        return;
+    }
+
+    build_scan_settings_xml(xml, sizeof(xml));
+
+    printf("Starting scan job...\n");
+    status = http_post_xml(scanner_host, scanner_port, "/eSCL/ScanJobs", xml,
+                            location, sizeof(location));
+    if (status != 201 || !location[0]) {
+        printf("ScanJobs failed (status %d)\n", status);
+        return;
+    }
+
+    normalize_location_path(location, job_path, sizeof(job_path));
+    printf("Job created: %s\n", job_path);
+
+    printf("Downloading to %s...\n", savepath_buffer);
+    if (download_next_document(scanner_host, scanner_port, job_path,
+                                savepath_buffer, &bytes_written)) {
+        printf("Saved %ld bytes to %s\n", bytes_written, savepath_buffer);
+    } else {
+        printf("Scan failed\n");
+    }
+
+    http_delete(scanner_host, scanner_port, job_path);
+}
+
+static void do_discover(void) {
+    printf("Searching LAN for scanners (mDNS)...\n");
+    discovered_count = 0;
+
+    {
+        static const char *uscan_labels[] = { "_uscan", "_tcp", "local", NULL };
+        static const char *uscans_labels[] = { "_uscans", "_tcp", "local", NULL };
+        discovered_count = mdns_discover_scanners(discovered_count, MAX_DISCOVERY_RESULTS,
+                                                   uscan_labels, "eSCL");
+        discovered_count = mdns_discover_scanners(discovered_count, MAX_DISCOVERY_RESULTS,
+                                                   uscans_labels, "eSCL/TLS");
+    }
+
+    rebuild_scanner_dropdown();
+
+    if (discovered_count > 0) {
+        select_discovered_scanner(0);
+        query_capabilities(scanner_host, scanner_port);
+    } else {
+        printf("No scanners found\n");
+    }
+}
+
+/* --------------------------------------------------------------------
+ * GUI
+ * ----------------------------------------------------------------- */
+
+static struct Gadget *find_gadget_by_id(struct Window *win, int id);
+static struct Gadget *find_model_gadget(struct Window *win);
+
+static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWORD topborder) {
+    struct NewGadget ng;
+    struct Gadget *gad;
+
+    gad = CreateContext(glistptr);
+    if (!gad) return NULL;
+
+    ng.ng_TextAttr = &Topaz80;
+    ng.ng_VisualInfo = ivi;
+    ng.ng_Flags = NG_HIGHLABEL;
+
+    ng.ng_LeftEdge = 100;
+    ng.ng_TopEdge = 5 + topborder;
+    ng.ng_Width = 250;
+    ng.ng_Height = 12;
+    ng.ng_GadgetText = (STRPTR)"Scanner:";
+    ng.ng_GadgetID = GAD_SCANNER_DROPDOWN;
+    gad = CreateGadget(CYCLE_KIND, gad, &ng,
+        GTCY_Labels, (ULONG)scanner_dropdown_labels,
+        GTCY_Active, 0,
+        TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_LeftEdge = 370;
+    ng.ng_Width = 90;
+    ng.ng_GadgetText = (STRPTR)"_Discover";
+    ng.ng_GadgetID = GAD_DISCOVER_BUTTON;
+    ng.ng_Flags = 0;
+    gad = CreateGadget(BUTTON_KIND, gad, &ng, GT_Underscore, '_', TAG_DONE);
+    if (!gad) return NULL;
+    ng.ng_Flags = NG_HIGHLABEL;
+
+    ng.ng_LeftEdge = 100;
+    ng.ng_TopEdge += 20;
+    ng.ng_Width = 350;
+    ng.ng_Height = 14;
+    ng.ng_GadgetText = (STRPTR)"Model:";
+    ng.ng_GadgetID = GAD_MODEL_DISPLAY;
+    gad = CreateGadget(STRING_KIND, gad, &ng,
+        GTST_String, (ULONG)scanner_make_model,
+        GTST_MaxChars, sizeof(scanner_make_model) - 1,
+        GA_Disabled, TRUE,
+        TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_LeftEdge = 100;
+    ng.ng_TopEdge += 20;
+    ng.ng_Width = 150;
+    ng.ng_Height = 12;
+    ng.ng_GadgetText = (STRPTR)"Source:";
+    ng.ng_GadgetID = GAD_SOURCE_DROPDOWN;
+    gad = CreateGadget(CYCLE_KIND, gad, &ng,
+        GTCY_Labels, (ULONG)source_labels, GTCY_Active, source_index, TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_TopEdge += 20;
+    ng.ng_GadgetText = (STRPTR)"Colour:";
+    ng.ng_GadgetID = GAD_COLOR_DROPDOWN;
+    gad = CreateGadget(CYCLE_KIND, gad, &ng,
+        GTCY_Labels, (ULONG)color_labels, GTCY_Active, color_index, TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_TopEdge += 20;
+    ng.ng_Width = 100;
+    ng.ng_GadgetText = (STRPTR)"DPI:";
+    ng.ng_GadgetID = GAD_DPI_DROPDOWN;
+    gad = CreateGadget(CYCLE_KIND, gad, &ng,
+        GTCY_Labels, (ULONG)dpi_labels, GTCY_Active, dpi_index, TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_TopEdge += 20;
+    ng.ng_GadgetText = (STRPTR)"Format:";
+    ng.ng_GadgetID = GAD_FORMAT_DROPDOWN;
+    gad = CreateGadget(CYCLE_KIND, gad, &ng,
+        GTCY_Labels, (ULONG)format_labels, GTCY_Active, format_index, TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_TopEdge += 20;
+    ng.ng_GadgetText = (STRPTR)"Size:";
+    ng.ng_GadgetID = GAD_SIZE_DROPDOWN;
+    gad = CreateGadget(CYCLE_KIND, gad, &ng,
+        GTCY_Labels, (ULONG)size_labels, GTCY_Active, size_index, TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_LeftEdge = 100;
+    ng.ng_TopEdge += 20;
+    ng.ng_Width = 360;
+    ng.ng_Height = 14;
+    ng.ng_GadgetText = (STRPTR)"Save _to:";
+    ng.ng_GadgetID = GAD_SAVEPATH_STRING;
+    gad = CreateGadget(STRING_KIND, gad, &ng,
+        GTST_String, (ULONG)savepath_buffer,
+        GTST_MaxChars, sizeof(savepath_buffer) - 1,
+        GA_Immediate, TRUE,
+        GT_Underscore, '_',
+        GACT_RELVERIFY, TRUE,
+        TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_LeftEdge = 10;
+    ng.ng_TopEdge += 30;
+    ng.ng_Width = 100;
+    ng.ng_Height = 14;
+    ng.ng_GadgetText = (STRPTR)"_Scan";
+    ng.ng_GadgetID = GAD_SCAN_BUTTON;
+    gad = CreateGadget(BUTTON_KIND, gad, &ng, GT_Underscore, '_', TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_LeftEdge = 190;
+    ng.ng_Width = 110;
+    ng.ng_GadgetText = (STRPTR)"S_ave Config";
+    ng.ng_GadgetID = GAD_SAVE_BUTTON;
+    gad = CreateGadget(BUTTON_KIND, gad, &ng, GT_Underscore, '_', TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_LeftEdge = 370;
+    ng.ng_Width = 90;
+    ng.ng_GadgetText = (STRPTR)"_Exit";
+    ng.ng_GadgetID = GAD_EXIT_BUTTON;
+    gad = CreateGadget(BUTTON_KIND, gad, &ng, GT_Underscore, '_', TAG_DONE);
+    if (!gad) return NULL;
+
+    return gad;
+}
+
+static void process_window_events(struct Window *win) {
+    struct IntuiMessage *imsg;
+    ULONG imsgClass;
+    struct Gadget *gad;
+    BOOL terminated = FALSE;
+
+    while (!terminated) {
+        Wait(1L << win->UserPort->mp_SigBit);
+
+        imsg = GT_GetIMsg(win->UserPort);
+        while (!terminated && imsg) {
+            gad = (struct Gadget *)imsg->IAddress;
+            imsgClass = imsg->Class;
+
+            GT_ReplyIMsg(imsg);
+
+            switch (imsgClass) {
+                case IDCMP_GADGETUP:
+                    switch (gad->GadgetID) {
+                        case GAD_SCANNER_DROPDOWN: {
+                            if (!operation_in_progress) {
+                                ULONG selected = 0;
+                                struct Gadget *mg;
+                                operation_in_progress = TRUE;
+                                GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &selected, TAG_DONE);
+                                select_discovered_scanner((int)selected);
+                                if (scanner_host[0]) query_capabilities(scanner_host, scanner_port);
+                                mg = find_model_gadget(win);
+                                if (mg) {
+                                    GT_SetGadgetAttrs(mg, win, NULL,
+                                                       GTST_String, (ULONG)scanner_make_model, TAG_DONE);
+                                }
+                                operation_in_progress = FALSE;
+                            }
+                            break;
+                        }
+                        case GAD_DISCOVER_BUTTON:
+                            if (!operation_in_progress) {
+                                struct Gadget *sg, *mg;
+                                operation_in_progress = TRUE;
+                                do_discover();
+                                sg = find_gadget_by_id(win, GAD_SCANNER_DROPDOWN);
+                                if (sg) {
+                                    GT_SetGadgetAttrs(sg, win, NULL,
+                                        GTCY_Labels, (ULONG)scanner_dropdown_labels,
+                                        GTCY_Active, 0, TAG_DONE);
+                                }
+                                mg = find_model_gadget(win);
+                                if (mg) {
+                                    GT_SetGadgetAttrs(mg, win, NULL,
+                                                       GTST_String, (ULONG)scanner_make_model, TAG_DONE);
+                                }
+                                operation_in_progress = FALSE;
+                            }
+                            break;
+                        case GAD_SOURCE_DROPDOWN: {
+                            ULONG v = 0;
+                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &v, TAG_DONE);
+                            source_index = (int)v;
+                            break;
+                        }
+                        case GAD_COLOR_DROPDOWN: {
+                            ULONG v = 0;
+                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &v, TAG_DONE);
+                            color_index = (int)v;
+                            break;
+                        }
+                        case GAD_DPI_DROPDOWN: {
+                            ULONG v = 0;
+                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &v, TAG_DONE);
+                            dpi_index = (int)v;
+                            break;
+                        }
+                        case GAD_FORMAT_DROPDOWN: {
+                            ULONG v = 0;
+                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &v, TAG_DONE);
+                            format_index = (int)v;
+                            break;
+                        }
+                        case GAD_SIZE_DROPDOWN: {
+                            ULONG v = 0;
+                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &v, TAG_DONE);
+                            size_index = (int)v;
+                            break;
+                        }
+                        case GAD_SAVEPATH_STRING:
+                            /* savepath_buffer is the gadget's own backing store */
+                            break;
+                        case GAD_SCAN_BUTTON:
+                            if (!operation_in_progress) {
+                                operation_in_progress = TRUE;
+                                do_scan();
+                                operation_in_progress = FALSE;
+                            }
+                            break;
+                        case GAD_SAVE_BUTTON:
+                            if (save_config()) {
+                                printf("Saved to ENV(ARC):MintSCAN/Unit0\n");
+                            } else {
+                                printf("Save failed\n");
+                            }
+                            break;
+                        case GAD_EXIT_BUTTON:
+                            terminated = TRUE;
+                            break;
+                    }
+                    break;
+
+                case IDCMP_CLOSEWINDOW:
+                    terminated = TRUE;
+                    break;
+
+                case IDCMP_REFRESHWINDOW:
+                    GT_BeginRefresh(win);
+                    GT_EndRefresh(win, TRUE);
+                    redraw_output_box();
+                    break;
+            }
+
+            imsg = terminated ? NULL : GT_GetIMsg(win->UserPort);
+        }
+    }
+}
+
+static struct Gadget *find_gadget_by_id(struct Window *win, int id) {
+    struct Gadget *g = glist;
+    (void)win;
+    while (g && g->GadgetID != id) g = g->NextGadget;
+    return g;
+}
+
+static struct Gadget *find_model_gadget(struct Window *win) {
+    return find_gadget_by_id(win, GAD_MODEL_DISPLAY);
+}
+
+int main(void) {
+    UWORD topborder;
+
+    IntuitionBase = (struct IntuitionBase *)OpenLibrary("intuition.library", 39);
+    if (!IntuitionBase) return 1;
+
+    GfxBase = (struct GfxBase *)OpenLibrary("graphics.library", 39);
+    if (!GfxBase) { CloseLibrary((struct Library *)IntuitionBase); return 1; }
+
+    GadToolsBase = OpenLibrary("gadtools.library", 39);
+    if (!GadToolsBase) {
+        CloseLibrary((struct Library *)GfxBase);
+        CloseLibrary((struct Library *)IntuitionBase);
+        return 1;
+    }
+
+    SocketBase = OpenLibrary("bsdsocket.library", 0);
+    if (!SocketBase) {
+        CloseLibrary(GadToolsBase);
+        CloseLibrary((struct Library *)GfxBase);
+        CloseLibrary((struct Library *)IntuitionBase);
+        return 1;
+    }
+
+    font = OpenFont(&Topaz60);
+    if (!font) {
+        CloseLibrary(SocketBase);
+        CloseLibrary(GadToolsBase);
+        CloseLibrary((struct Library *)GfxBase);
+        CloseLibrary((struct Library *)IntuitionBase);
+        return 1;
+    }
+
+    screen = LockPubScreen(NULL);
+    if (!screen) {
+        CloseFont(font);
+        CloseLibrary(SocketBase);
+        CloseLibrary(GadToolsBase);
+        CloseLibrary((struct Library *)GfxBase);
+        CloseLibrary((struct Library *)IntuitionBase);
+        return 1;
+    }
+
+    vi = GetVisualInfo(screen, TAG_DONE);
+    if (!vi) {
+        UnlockPubScreen(NULL, screen);
+        CloseFont(font);
+        CloseLibrary(SocketBase);
+        CloseLibrary(GadToolsBase);
+        CloseLibrary((struct Library *)GfxBase);
+        CloseLibrary((struct Library *)IntuitionBase);
+        return 1;
+    }
+
+    topborder = screen->WBorTop + (screen->Font->ta_YSize + 1);
+
+    load_config();
+    rebuild_scanner_dropdown();
+
+    if (!createAllGadgets(&glist, vi, topborder)) {
+        FreeVisualInfo(vi);
+        UnlockPubScreen(NULL, screen);
+        CloseFont(font);
+        CloseLibrary(SocketBase);
+        CloseLibrary(GadToolsBase);
+        CloseLibrary((struct Library *)GfxBase);
+        CloseLibrary((struct Library *)IntuitionBase);
+        return 1;
+    }
+
+    window = OpenWindowTags(NULL,
+        WA_Title, (ULONG)"MintSCAN",
+        WA_Gadgets, (ULONG)glist,
+        WA_AutoAdjust, TRUE,
+        WA_Width, 480,
+        WA_MinWidth, 480,
+        WA_InnerHeight, 320,
+        WA_MinHeight, 320,
+        WA_DragBar, TRUE,
+        WA_DepthGadget, TRUE,
+        WA_Activate, TRUE,
+        WA_CloseGadget, TRUE,
+        WA_SizeGadget, TRUE,
+        WA_SimpleRefresh, TRUE,
+        WA_NewLookMenus, TRUE,
+        WA_IDCMP, IDCMP_CLOSEWINDOW | IDCMP_REFRESHWINDOW | STRINGIDCMP | BUTTONIDCMP | CYCLEIDCMP,
+        WA_PubScreen, (ULONG)screen,
+        TAG_DONE);
+
+    if (!window) {
+        FreeGadgets(glist);
+        FreeVisualInfo(vi);
+        UnlockPubScreen(NULL, screen);
+        CloseFont(font);
+        CloseLibrary(SocketBase);
+        CloseLibrary(GadToolsBase);
+        CloseLibrary((struct Library *)GfxBase);
+        CloseLibrary((struct Library *)IntuitionBase);
+        return 1;
+    }
+
+    custom_printf("CLEAR");
+    GT_RefreshWindow(window, NULL);
+
+    if (scanner_host[0]) {
+        printf("Loaded saved scanner: %s\n", scanner_host);
+    } else {
+        printf("Click Discover to find scanners on the LAN\n");
+    }
+
+    process_window_events(window);
+
+    if (window) { CloseWindow(window); window = NULL; }
+    if (glist) { FreeGadgets(glist); glist = NULL; }
+
+    if (vi) { FreeVisualInfo(vi); vi = NULL; }
+    if (screen) { UnlockPubScreen(NULL, screen); screen = NULL; }
+    if (font) { CloseFont(font); font = NULL; }
+
+    CloseLibrary(SocketBase);
+    CloseLibrary(GadToolsBase);
+    CloseLibrary((struct Library *)GfxBase);
+    CloseLibrary((struct Library *)IntuitionBase);
+
+    return 0;
+}

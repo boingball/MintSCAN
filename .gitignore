@@ -1,0 +1,5 @@
+build/
+release/
+MintScan
+*.o
+*.map
