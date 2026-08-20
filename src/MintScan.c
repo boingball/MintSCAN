@@ -776,11 +776,97 @@ static void normalize_location_path(const char *location, char *path_out, int pa
     path_out[path_size - 1] = '\0';
 }
 
+/* Chunked-transfer decoder for NextDocument responses. Several real
+   eSCL scanners (Brother's included) send "Transfer-Encoding: chunked"
+   instead of Content-Length here - without decoding it, the hex chunk-
+   size lines and CRLF framing end up written into the file as if they
+   were image bytes, producing a file that's roughly the right size but
+   corrupt (the symptom that led to this). */
+enum ChunkState { CS_SIZE, CS_SIZE_CR, CS_DATA, CS_DATA_CR, CS_DATA_LF, CS_DONE };
+
+struct ChunkDecoder {
+    enum ChunkState state;
+    long remaining;
+    char sizebuf[16];
+    int sizelen;
+};
+
+static void chunk_decoder_init(struct ChunkDecoder *cd) {
+    cd->state = CS_SIZE;
+    cd->remaining = 0;
+    cd->sizelen = 0;
+}
+
+/* Feeds len raw (still chunk-encoded) bytes through the decoder, writing
+   only the actual payload - not the size lines or chunk CRLFs - to
+   outfile. Returns TRUE once the terminating 0-length chunk has been
+   seen. Trailer headers after that chunk (rare - most servers just send
+   "0\r\n\r\n") are not parsed; anything after it is ignored. */
+static BOOL chunk_decoder_feed(struct ChunkDecoder *cd, const char *buf, int len,
+                                BPTR outfile, long *written) {
+    int i = 0;
+
+    while (i < len) {
+        switch (cd->state) {
+        case CS_SIZE:
+            if (buf[i] == '\r') {
+                cd->state = CS_SIZE_CR;
+                i++;
+            } else if (buf[i] == ';') {
+                while (i < len && buf[i] != '\r') i++;
+            } else {
+                if (cd->sizelen < (int)sizeof(cd->sizebuf) - 1) {
+                    cd->sizebuf[cd->sizelen++] = buf[i];
+                }
+                i++;
+            }
+            break;
+
+        case CS_SIZE_CR:
+            if (buf[i] != '\n') { cd->state = CS_DONE; return TRUE; }
+            cd->sizebuf[cd->sizelen] = '\0';
+            cd->remaining = strtol(cd->sizebuf, NULL, 16);
+            cd->sizelen = 0;
+            i++;
+            if (cd->remaining == 0) { cd->state = CS_DONE; return TRUE; }
+            cd->state = CS_DATA;
+            break;
+
+        case CS_DATA: {
+            int avail = len - i;
+            int take = (cd->remaining < (long)avail) ? (int)cd->remaining : avail;
+            if (take > 0) {
+                Write(outfile, (APTR)(buf + i), take);
+                *written += take;
+                cd->remaining -= take;
+                i += take;
+            }
+            if (cd->remaining == 0) cd->state = CS_DATA_CR;
+            break;
+        }
+
+        case CS_DATA_CR:
+            cd->state = CS_DATA_LF;
+            i++;
+            break;
+
+        case CS_DATA_LF:
+            cd->state = CS_SIZE;
+            i++;
+            break;
+
+        case CS_DONE:
+            return TRUE;
+        }
+    }
+    return cd->state == CS_DONE;
+}
+
 /* Downloads NextDocument straight to disk, splitting the HTTP header
    from the binary body as bytes arrive rather than buffering the whole
-   image in memory first. Honours Content-Length when the server sends
-   one; otherwise reads until the connection closes. Does NOT handle
-   Transfer-Encoding: chunked yet - see docs/ARCHITECTURE.md. */
+   image in memory first. Honours Content-Length or Transfer-Encoding:
+   chunked when the server sends either; otherwise reads until the
+   connection closes. */
 static BOOL download_next_document(const char *ip, int port, const char *job_path,
                                     const char *save_path, long *bytes_out) {
     int sockfd;
@@ -789,6 +875,9 @@ static BOOL download_next_document(const char *ip, int port, const char *job_pat
     char headbuf[2048];
     int headlen = 0;
     BOOL header_done = FALSE;
+    BOOL is_chunked = FALSE;
+    BOOL chunked_done = FALSE;
+    struct ChunkDecoder cd;
     long content_length = -1;
     long written = 0;
     BPTR outfile;
@@ -845,6 +934,22 @@ static BOOL download_next_document(const char *ip, int port, const char *job_pat
                     while (*cl == ' ') cl++;
                     content_length = atol(cl);
                 }
+                {
+                    char *te = strstr(headbuf, "Transfer-Encoding:");
+                    if (!te) te = strstr(headbuf, "transfer-encoding:");
+                    if (te) {
+                        char line[64];
+                        char *lend = strstr(te, "\r\n");
+                        int linelen = lend ? (int)(lend - te) : (int)strlen(te);
+                        if (linelen >= (int)sizeof(line)) linelen = sizeof(line) - 1;
+                        memcpy(line, te, linelen);
+                        line[linelen] = '\0';
+                        if (strstr(line, "chunked") || strstr(line, "Chunked")) {
+                            is_chunked = TRUE;
+                            chunk_decoder_init(&cd);
+                        }
+                    }
+                }
 
                 header_done = TRUE;
 
@@ -857,16 +962,27 @@ static BOOL download_next_document(const char *ip, int port, const char *job_pat
                 }
 
                 if (body_in_chunk > 0) {
-                    Write(outfile, chunk + (received - body_in_chunk), body_in_chunk);
-                    written += body_in_chunk;
+                    if (is_chunked) {
+                        chunked_done = chunk_decoder_feed(&cd, chunk + (received - body_in_chunk),
+                                                           body_in_chunk, outfile, &written);
+                    } else {
+                        Write(outfile, chunk + (received - body_in_chunk), body_in_chunk);
+                        written += body_in_chunk;
+                    }
                 }
             }
+        } else if (is_chunked) {
+            chunked_done = chunk_decoder_feed(&cd, chunk, received, outfile, &written);
         } else {
             Write(outfile, chunk, received);
             written += received;
         }
 
-        if (content_length >= 0 && written >= content_length) break;
+        if (is_chunked) {
+            if (chunked_done) break;
+        } else if (content_length >= 0 && written >= content_length) {
+            break;
+        }
     }
 
     Close(outfile);

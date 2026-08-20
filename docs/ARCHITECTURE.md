@@ -45,10 +45,11 @@ entirely and go straight to `ScannerCapabilities`.
 
 ## Known limitations / next steps
 
-- **`NextDocument` download assumes `Content-Length` or a server that
-  closes the connection when done.** No `Transfer-Encoding: chunked`
-  support yet. Some scanners chunk this response; those will currently
-  fail or truncate.
+- **`NextDocument` handles `Content-Length`, `Transfer-Encoding: chunked`,
+  and a server that just closes the connection when done.** The chunked
+  decoder is a plain, tolerant state machine (`chunk_decoder_feed()`) -
+  it doesn't parse trailer headers after the terminating 0-length chunk
+  (rare in practice; most servers send `0\r\n\r\n` and stop).
 - **HTTPS (`_uscans._tcp`) scanners are discovered but not actually
   reachable** - eSCL-over-TLS needs AmiSSL wired into the HTTP client,
   which isn't done yet. Plain-HTTP eSCL (`_uscan._tcp`, the common case)
