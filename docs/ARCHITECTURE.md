@@ -57,12 +57,20 @@ entirely and go straight to `ScannerCapabilities`.
 - **ADF and duplex are not implemented.** `ScanRegions` is always a
   single full-page region at (0,0); there's no multi-page loop.
 - **`ScannerCapabilities` is only lightly scraped**, not fully parsed.
-  `pwg:MakeAndModel` (for display), DPI (every `XResolution>NNN<` value),
-  and Colour mode (whichever of RGB24/Grayscale8/BlackAndWhite1 the
-  response mentions at all) come from the real response. Neither scrape
-  is scoped per-source (Platen vs Adf can support different values; this
-  records the union of both). Source/Format/Size have no capability
-  check at all.
+  `pwg:MakeAndModel` (for display) comes straight from the raw response.
+  DPI (every `XResolution>NNN<` value) and Colour mode (whichever of
+  RGB24/Grayscale8/BlackAndWhite1 turn up) are scraped from whichever
+  Source is currently selected: `extract_source_block()` pulls out the
+  substring between `<scan:Platen>`/`<scan:Adf>` and its closing tag
+  (matching the Source dropdown) before `scrape_dpi_values()`/
+  `scrape_color_values()` run - a scanner can support different values
+  per source (e.g. higher DPI or colour modes on the ADF but not the
+  flatbed), and scraping the whole document conflated the two, which is
+  exactly why an offered/scraped value could still get silently rejected
+  by the scanner. Falls back to scraping the whole document if the
+  current Source isn't broken out as its own element (some
+  capabilities responses don't split them). Source/Format/Size have no
+  capability check at all.
 
   **The DPI and Colour dropdowns themselves are always the same fixed
   list** (`dpi_gui_values`/`color_all_labels`) - they are never rebuilt
@@ -75,11 +83,13 @@ entirely and go straight to `ScannerCapabilities`.
   honoured. This is a known GadTools gotcha MintPRINT itself works
   around by never live-updating a cycle gadget's label list once
   created. Instead, `resolve_dpi()`/`resolve_color_value()` (called from
-  `build_scan_settings_xml()`) validate the selected value against
-  what the scanner actually scraped and substitute the closest/first
-  supported one if needed - printing a status line so a substitution is
-  never silent, which is what "requested 300 DPI, got 200" originally
-  looked like before this existed.
+  `build_scan_settings_xml()`) validate the selected value against what
+  that Source actually scraped and substitute the closest/first
+  supported one if needed. `build_scan_settings_xml()` also always
+  prints exactly what it's about to request (DPI/ColorMode/Source), not
+  just on substitution - if a scanner still ignores an honestly-supported
+  value, that line is the next thing to check, not which value got
+  picked client-side.
 - **Page sizes (A4/Letter/Legal/A3) are a fixed guess, not derived from
   `MaxWidth`/`MaxHeight`.** A3 was added because a real scanner turned
   out to support it, not because it's queried - a flatbed too small for

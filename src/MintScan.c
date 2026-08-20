@@ -83,11 +83,21 @@ static int  scanner_port = 80;
 static char scanner_make_model[96] = "";
 static BOOL have_capabilities = FALSE;
 
+/* Raw ScannerCapabilities body from the last successful query, kept
+   around so resolve_dpi()/resolve_color_value() can re-scope their
+   scrape to whichever Source is selected *at scan time* - not
+   necessarily the one that was active when the query ran. */
+static char capabilities_xml[MAX_BUFFER] = "";
+
 /* Option tables. Labels are what GadTools shows; the parallel array is
    what actually goes into the eSCL request. Kept as a fixed set rather
    than parsed from ScannerCapabilities - see docs/ARCHITECTURE.md. */
 static STRPTR source_labels[] = { (STRPTR)"Flatbed", (STRPTR)"Feeder (ADF)", NULL };
 static const char *source_values[] = { "Platen", "Feeder" };
+/* The ScannerCapabilities element each Source scans under - not the
+   same string as pwg:InputSource above (that's "Feeder", this is
+   "Adf"). Used to scope the DPI/Colour capability scrape. */
+static const char *source_capability_tags[] = { "scan:Platen", "scan:Adf" };
 
 /* Colour dropdown - a fixed, never-swapped list (see the long comment on
    dpi_gui_values below for why it stays fixed). color_index indexes both
@@ -97,14 +107,6 @@ static STRPTR color_all_labels[COLOR_MODE_COUNT + 1] = {
     (STRPTR)"Colour", (STRPTR)"Grayscale", (STRPTR)"Black & White", NULL
 };
 static const char *color_all_values[COLOR_MODE_COUNT] = { "RGB24", "Grayscale8", "BlackAndWhite1" };
-
-/* Which of color_all_values[] the scanner's ScannerCapabilities response
-   actually mentions (indices into color_all_values) - populated by
-   update_color_options_from_capabilities(), used only to snap the
-   request in build_scan_settings_xml(), never to change the dropdown
-   itself. See the dpi_supported_* comment below for why. */
-static int color_supported_master[COLOR_MODE_COUNT];
-static int color_supported_count = 0;
 
 /* DPI dropdown - a fixed, never-swapped list. Tried making this (and
    Colour, above) reflect ScannerCapabilities by swapping the live
@@ -124,13 +126,6 @@ static STRPTR dpi_gui_labels[] = {
     (STRPTR)"100", (STRPTR)"150", (STRPTR)"200", (STRPTR)"300", (STRPTR)"600", NULL
 };
 #define DPI_GUI_COUNT 5
-
-/* Which resolutions the scanner's ScannerCapabilities response actually
-   advertises (not necessarily a subset of dpi_gui_values - could include
-   values the fixed dropdown doesn't even list) - populated by
-   update_dpi_options_from_capabilities(), used only to snap the request. */
-static int dpi_supported_values[MAX_DPI_OPTIONS];
-static int dpi_supported_count = 0;
 
 static STRPTR format_labels[] = { (STRPTR)"JPEG", (STRPTR)"PNG", (STRPTR)"PDF", NULL };
 static const char *format_mimes[] = { "image/jpeg", "image/png", "application/pdf" };
@@ -538,16 +533,42 @@ static int mdns_discover_scanners(int count_io, int max_results, const char **la
     return count;
 }
 
-/* Scrapes every "...XResolution>NNN</..." in a ScannerCapabilities
-   response - covering both Platen and Adf DiscreteResolutions - into a
-   sorted, deduplicated list of what the scanner actually supports.
-   Doesn't touch the dropdown (see the dpi_gui_values comment above for
-   why) - just feeds resolve_dpi(), called when the scan request is
-   built. Leaves dpi_supported_count at 0 (meaning "unknown, don't
-   second-guess the user's selection") if the scanner doesn't advertise
-   a discrete list at all (e.g. only a resolution range). */
-static void update_dpi_options_from_capabilities(const char *xml) {
-    int values[MAX_DPI_OPTIONS];
+/* Extracts the substring between <tag ...> and </tag> (namespace prefix
+   included, e.g. "scan:Platen") into out. Leaves out empty if the
+   element isn't found - callers fall back to scanning the whole
+   document in that case, since some scanners' capabilities responses
+   don't split Platen/Adf into separate elements at all. */
+static void extract_source_block(const char *xml, const char *tag, char *out, int out_size) {
+    char open_tag[32], close_tag[32];
+    const char *start, *body, *end;
+
+    out[0] = '\0';
+    snprintf(open_tag, sizeof(open_tag), "<%s", tag);
+    snprintf(close_tag, sizeof(close_tag), "</%s>", tag);
+
+    start = strstr(xml, open_tag);
+    if (!start) return;
+    body = strchr(start, '>');
+    if (!body) return;
+    body++;
+
+    end = strstr(body, close_tag);
+    if (!end) return;
+
+    {
+        int len = (int)(end - body);
+        if (len >= out_size) len = out_size - 1;
+        memcpy(out, body, len);
+        out[len] = '\0';
+    }
+}
+
+/* Scrapes every "...XResolution>NNN</..." out of a (source-scoped, see
+   extract_source_block) ScannerCapabilities fragment into a sorted,
+   deduplicated list. Returns the count found (0 if none - the scanner
+   doesn't advertise a discrete list at all, e.g. only a resolution
+   range). */
+static int scrape_dpi_values(const char *xml, int *out) {
     int count = 0;
     int i;
     const char *p = xml;
@@ -558,80 +579,86 @@ static void update_dpi_options_from_capabilities(const char *xml) {
         v = atoi(p);
         if (v > 0) {
             int dup = 0;
-            for (i = 0; i < count; i++) if (values[i] == v) { dup = 1; break; }
-            if (!dup && count < MAX_DPI_OPTIONS) values[count++] = v;
+            for (i = 0; i < count; i++) if (out[i] == v) { dup = 1; break; }
+            if (!dup && count < MAX_DPI_OPTIONS) out[count++] = v;
         }
     }
 
-    if (count == 0) return;
-
     for (i = 1; i < count; i++) {
-        int key = values[i];
+        int key = out[i];
         int j = i - 1;
-        while (j >= 0 && values[j] > key) { values[j + 1] = values[j]; j--; }
-        values[j + 1] = key;
+        while (j >= 0 && out[j] > key) { out[j + 1] = out[j]; j--; }
+        out[j + 1] = key;
     }
-
-    for (i = 0; i < count; i++) dpi_supported_values[i] = values[i];
-    dpi_supported_count = count;
+    return count;
 }
 
 /* Returns the DPI to actually put in the eSCL request: the selected
-   dpi_gui_values[dpi_index] as-is if it's known to be supported (or if
-   we don't know what's supported - no query has run yet), otherwise the
-   closest value the scanner actually advertised. Prints a status line
-   when it substitutes something, so a silent mismatch (the original bug
-   report) is never silent again. */
+   dpi_gui_values[dpi_index] as-is if it's known to be supported for the
+   *currently selected Source* (or if we don't know - no query has run
+   yet), otherwise the closest value that source actually advertised.
+   Prints a status line when it substitutes something, so a silent
+   mismatch (the original bug report) is never silent again. Falls back
+   to scraping the whole capabilities document if the current Source
+   isn't broken out as its own element in it. */
 static int resolve_dpi(void) {
+    static char scoped[8192];
     int requested = dpi_gui_values[dpi_index];
-    int i, best;
+    int supported[MAX_DPI_OPTIONS];
+    int count, i, best;
 
-    if (dpi_supported_count == 0) return requested;
-    for (i = 0; i < dpi_supported_count; i++) {
-        if (dpi_supported_values[i] == requested) return requested;
-    }
+    if (!have_capabilities) return requested;
 
-    best = dpi_supported_values[0];
-    for (i = 1; i < dpi_supported_count; i++) {
-        if (abs(dpi_supported_values[i] - requested) < abs(best - requested)) {
-            best = dpi_supported_values[i];
-        }
+    extract_source_block(capabilities_xml, source_capability_tags[source_index], scoped, sizeof(scoped));
+    count = scrape_dpi_values(scoped[0] ? scoped : capabilities_xml, supported);
+    if (count == 0) return requested;
+
+    for (i = 0; i < count; i++) if (supported[i] == requested) return requested;
+
+    best = supported[0];
+    for (i = 1; i < count; i++) {
+        if (abs(supported[i] - requested) < abs(best - requested)) best = supported[i];
     }
-    printf("%d DPI not supported - using %d DPI\n", requested, best);
+    printf("%d DPI not supported for %s - using %d DPI\n",
+           requested, (char *)source_labels[source_index], best);
     return best;
 }
 
-/* Records which of RGB24/Grayscale8/BlackAndWhite1 the scanner's
-   ScannerCapabilities response actually mentions - not scoped to the
-   currently selected Source, same approximation as the DPI scrape
-   above. Feeds resolve_color_value(); doesn't touch the dropdown. */
-static void update_color_options_from_capabilities(const char *xml) {
+/* Same idea as scrape_dpi_values but for ColorMode: records which of
+   RGB24/Grayscale8/BlackAndWhite1 appear anywhere in a (source-scoped)
+   capabilities fragment. Returns the count found. */
+static int scrape_color_values(const char *xml, int *out_master) {
     int count = 0;
     int i;
 
     for (i = 0; i < COLOR_MODE_COUNT; i++) {
-        if (strstr(xml, color_all_values[i])) {
-            color_supported_master[count++] = i;
-        }
+        if (strstr(xml, color_all_values[i])) out_master[count++] = i;
     }
-    color_supported_count = count;
+    return count;
 }
 
 /* Returns the eSCL ColorMode value to actually put in the request: the
-   selected mode as-is if it's supported (or unknown - no query has run
-   yet), otherwise the first mode the scanner does support. Prints a
-   status line when it substitutes something. */
+   selected mode as-is if it's supported for the currently selected
+   Source (or unknown - no query has run yet), otherwise the first mode
+   that source does support. Prints a status line when it substitutes
+   something. */
 static const char *resolve_color_value(void) {
-    int i;
+    static char scoped[8192];
+    int supported[COLOR_MODE_COUNT];
+    int count, i;
 
-    if (color_supported_count == 0) return color_all_values[color_index];
-    for (i = 0; i < color_supported_count; i++) {
-        if (color_supported_master[i] == color_index) return color_all_values[color_index];
-    }
+    if (!have_capabilities) return color_all_values[color_index];
 
-    printf("%s not supported - using %s\n",
-           (char *)color_all_labels[color_index], (char *)color_all_labels[color_supported_master[0]]);
-    return color_all_values[color_supported_master[0]];
+    extract_source_block(capabilities_xml, source_capability_tags[source_index], scoped, sizeof(scoped));
+    count = scrape_color_values(scoped[0] ? scoped : capabilities_xml, supported);
+    if (count == 0) return color_all_values[color_index];
+
+    for (i = 0; i < count; i++) if (supported[i] == color_index) return color_all_values[color_index];
+
+    printf("%s not supported for %s - using %s\n",
+           (char *)color_all_labels[color_index], (char *)source_labels[source_index],
+           (char *)color_all_labels[supported[0]]);
+    return color_all_values[supported[0]];
 }
 
 static void rebuild_scanner_dropdown(void) {
@@ -1147,20 +1174,20 @@ static BOOL download_next_document(const char *ip, int port, const char *job_pat
  * ----------------------------------------------------------------- */
 
 static void query_capabilities(const char *ip, int port) {
-    static char response[MAX_BUFFER];
     int status;
     char *tag, *end;
 
     printf("Querying capabilities: %s:%d\n", ip, port);
-    status = http_get(ip, port, "/eSCL/ScannerCapabilities", response, sizeof(response));
+    have_capabilities = FALSE;
+    status = http_get(ip, port, "/eSCL/ScannerCapabilities", capabilities_xml, sizeof(capabilities_xml));
     if (status != 200) {
         printf("ScannerCapabilities failed (status %d)\n", status);
-        have_capabilities = FALSE;
+        capabilities_xml[0] = '\0';
         return;
     }
 
     scanner_make_model[0] = '\0';
-    tag = strstr(response, "MakeAndModel>");
+    tag = strstr(capabilities_xml, "MakeAndModel>");
     if (tag) {
         tag += 13;
         end = strstr(tag, "</");
@@ -1171,9 +1198,6 @@ static void query_capabilities(const char *ip, int port) {
             scanner_make_model[len] = '\0';
         }
     }
-
-    update_dpi_options_from_capabilities(response);
-    update_color_options_from_capabilities(response);
 
     have_capabilities = TRUE;
     if (scanner_make_model[0]) {
@@ -1186,6 +1210,11 @@ static void query_capabilities(const char *ip, int port) {
 static void build_scan_settings_xml(char *buf, int buf_size) {
     int dpi = resolve_dpi();
     const char *color_value = resolve_color_value();
+
+    /* Always shown, not just on substitution - if the scanner still
+       ignores this, the request itself is the next thing to check, not
+       which value we picked. */
+    printf("Requesting: %d DPI, %s, %s\n", dpi, color_value, source_values[source_index]);
 
     snprintf(buf, buf_size,
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
