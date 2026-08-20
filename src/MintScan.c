@@ -102,9 +102,11 @@ static int size_index = 0;  /* A4 */
 static char savepath_buffer[256] = "RAM:scan001.jpg";
 
 /* Manual entry, for setups where mDNS multicast doesn't reach the Amiga
-   (e.g. WinUAE's SLIRP networking, which doesn't route 224.0.0.251) -
-   the GUI's own backing store for GAD_IP_STRING. Accepts "host" or
-   "host:port"; port defaults to 80. */
+   (e.g. WinUAE's SLIRP networking, which doesn't route 224.0.0.251).
+   GAD_IP_STRING's initial text - kept in sync with what's actually typed
+   via sync_string_gadget(), since GTST_String only seeds a string
+   gadget's content at creation and doesn't alias this buffer for live
+   edits. Accepts "host" or "host:port"; port defaults to 80. */
 static char ip_entry_buffer[70] = "";
 
 static char output_buffer[MAX_OUTPUT_LINES][MAX_OUTPUT_LINE_LENGTH];
@@ -984,6 +986,7 @@ static void do_discover(void) {
 
 static struct Gadget *find_gadget_by_id(struct Window *win, int id);
 static struct Gadget *find_model_gadget(struct Window *win);
+static void sync_string_gadget(struct Window *win, int gadget_id, char *dest, int dest_size);
 
 static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWORD topborder) {
     struct NewGadget ng;
@@ -1197,6 +1200,7 @@ static void process_window_events(struct Window *win) {
                                 char host[64];
                                 int port;
                                 operation_in_progress = TRUE;
+                                sync_string_gadget(win, GAD_IP_STRING, ip_entry_buffer, sizeof(ip_entry_buffer));
                                 if (parse_host_port(ip_entry_buffer, host, sizeof(host), &port)) {
                                     int idx = add_or_select_manual_ip(host, port);
                                     struct Gadget *sg, *mg;
@@ -1219,7 +1223,7 @@ static void process_window_events(struct Window *win) {
                             }
                             break;
                         case GAD_IP_STRING:
-                            /* ip_entry_buffer is the gadget's own backing store */
+                            sync_string_gadget(win, GAD_IP_STRING, ip_entry_buffer, sizeof(ip_entry_buffer));
                             break;
                         case GAD_SOURCE_DROPDOWN: {
                             ULONG v = 0;
@@ -1252,16 +1256,18 @@ static void process_window_events(struct Window *win) {
                             break;
                         }
                         case GAD_SAVEPATH_STRING:
-                            /* savepath_buffer is the gadget's own backing store */
+                            sync_string_gadget(win, GAD_SAVEPATH_STRING, savepath_buffer, sizeof(savepath_buffer));
                             break;
                         case GAD_SCAN_BUTTON:
                             if (!operation_in_progress) {
                                 operation_in_progress = TRUE;
+                                sync_string_gadget(win, GAD_SAVEPATH_STRING, savepath_buffer, sizeof(savepath_buffer));
                                 do_scan();
                                 operation_in_progress = FALSE;
                             }
                             break;
                         case GAD_SAVE_BUTTON:
+                            sync_string_gadget(win, GAD_SAVEPATH_STRING, savepath_buffer, sizeof(savepath_buffer));
                             if (save_config()) {
                                 printf("Saved to ENV(ARC):MintSCAN/Unit0\n");
                             } else {
@@ -1299,6 +1305,23 @@ static struct Gadget *find_gadget_by_id(struct Window *win, int id) {
 
 static struct Gadget *find_model_gadget(struct Window *win) {
     return find_gadget_by_id(win, GAD_MODEL_DISPLAY);
+}
+
+/* GTST_String only sets a string gadget's INITIAL text at creation time -
+   GadTools keeps its own internal edit buffer after that, so live typing
+   never touches the buffer we passed in. GT_GetGadgetAttrs(..., GTST_String,
+   ...) is the documented way to read back what's actually in the gadget
+   right now; call this before using anything the user may have typed. */
+static void sync_string_gadget(struct Window *win, int gadget_id, char *dest, int dest_size) {
+    struct Gadget *g = find_gadget_by_id(win, gadget_id);
+    STRPTR live = NULL;
+
+    if (!g) return;
+    GT_GetGadgetAttrs(g, win, NULL, GTST_String, (ULONG)&live, TAG_DONE);
+    if (live) {
+        strncpy(dest, (char *)live, dest_size - 1);
+        dest[dest_size - 1] = '\0';
+    }
 }
 
 int main(void) {
