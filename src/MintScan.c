@@ -135,7 +135,7 @@ static const char *format_extensions[] = { "jpg", "png", "pdf" };
    regardless of scan resolution (per the eSCL spec's ScanRegions). */
 static STRPTR size_labels[] = { (STRPTR)"A4", (STRPTR)"Letter", (STRPTR)"Legal", (STRPTR)"A3", NULL };
 static const int size_width_300[]  = { 2480, 2550, 2550, 3508 };
-static const int size_height_300[] = { 3507, 3300, 4200, 4961 };
+static const int size_height_300[] = { 3508, 3300, 4200, 4961 };
 
 static int source_index = 0;
 static int color_index = 0;
@@ -563,19 +563,21 @@ static void extract_source_block(const char *xml, const char *tag, char *out, in
     }
 }
 
-/* Scrapes every "...XResolution>NNN</..." out of a (source-scoped, see
-   extract_source_block) ScannerCapabilities fragment into a sorted,
-   deduplicated list. Returns the count found (0 if none - the scanner
-   doesn't advertise a discrete list at all, e.g. only a resolution
-   range). */
+/* Scrapes every exact <scan:XResolution>NNN</scan:XResolution> out of a
+   (source-scoped, see extract_source_block) ScannerCapabilities fragment
+   into a sorted, deduplicated list. Returns the count found (0 if none -
+   the scanner doesn't advertise a discrete list at all, e.g. only a
+   resolution range). Match the complete element name so
+   MaxOpticalXResolution can't be mistaken for a selectable resolution. */
 static int scrape_dpi_values(const char *xml, int *out) {
     int count = 0;
     int i;
     const char *p = xml;
+    const char *tag = "<scan:XResolution>";
 
-    while ((p = strstr(p, "XResolution>")) != NULL) {
+    while ((p = strstr(p, tag)) != NULL) {
         int v;
-        p += 13; /* strlen("XResolution>") */
+        p += strlen(tag);
         v = atoi(p);
         if (v > 0) {
             int dup = 0;
@@ -1207,50 +1209,70 @@ static void query_capabilities(const char *ip, int port) {
     }
 }
 
+/* sane-airscan records DocumentFormatExt support per source and only
+   emits scan:DocumentFormatExt when that source advertises it. Some
+   scanner firmware is permissive enough to return 201 Created for a
+   request it doesn't fully understand, then silently performs a default
+   scan instead, so don't send the extension blindly. */
+static BOOL source_uses_document_format_ext(void) {
+    static char scoped[8192];
+    const char *scope;
+
+    if (!have_capabilities) return FALSE;
+
+    scoped[0] = '\0';
+    extract_source_block(capabilities_xml, source_capability_tags[source_index],
+                         scoped, sizeof(scoped));
+    scope = scoped[0] ? scoped : capabilities_xml;
+
+    return strstr(scope, "DocumentFormatExt") != NULL;
+}
+
 static void build_scan_settings_xml(char *buf, int buf_size) {
     int dpi = resolve_dpi();
     const char *color_value = resolve_color_value();
+    const char *mime = format_mimes[format_index];
+    BOOL use_document_format_ext = source_uses_document_format_ext();
+    char format_ext[128];
+
+    format_ext[0] = '\0';
+    if (use_document_format_ext) {
+        snprintf(format_ext, sizeof(format_ext),
+                 "<scan:DocumentFormatExt>%s</scan:DocumentFormatExt>", mime);
+    }
 
     /* Always shown, not just on substitution - if the scanner still
        ignores this, the request itself is the next thing to check, not
        which value we picked. */
     printf("Requesting: %d DPI, %s, %s\n", dpi, color_value, source_values[source_index]);
 
-    /* pwg:ScanRegion's schema sequence puts ContentRegionUnits first,
-       before Height/Width/XOffset/YOffset - it was missing entirely
-       here before. Confirmed by testing that a real scanner can accept
-       the job (still returns 201/a valid image) while silently
-       ignoring every other requested field (resolution, colour mode)
-       and falling back to its own defaults for all of them - consistent
-       with a strict/fragile firmware parser failing region validation
-       and discarding the rest of the document rather than just that
-       one field. scan:Intent is likewise commonly present in working
-       real-world requests and cheap to include. */
+    /* IMPORTANT: keep this XML compact. Brother MFC-J6930DW firmware
+       accepts pretty-printed ScanSettings with HTTP 201 but silently
+       falls back to a 200-DPI default. sane-airscan uses compact XML. */
     snprintf(buf, buf_size,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-        "<scan:ScanSettings xmlns:scan=\"http://schemas.hp.com/imaging/escl/2011/05/03\" "
-        "xmlns:pwg=\"http://www.pwg.org/schemas/2010/12/sm\">\n"
-        "<pwg:Version>2.0</pwg:Version>\n"
-        "<scan:Intent>Document</scan:Intent>\n"
-        "<pwg:ScanRegions>\n"
-        "<pwg:ScanRegion>\n"
-        "<pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>\n"
-        "<pwg:Height>%d</pwg:Height>\n"
-        "<pwg:Width>%d</pwg:Width>\n"
-        "<pwg:XOffset>0</pwg:XOffset>\n"
-        "<pwg:YOffset>0</pwg:YOffset>\n"
-        "</pwg:ScanRegion>\n"
-        "</pwg:ScanRegions>\n"
-        "<pwg:InputSource>%s</pwg:InputSource>\n"
-        "<scan:ColorMode>%s</scan:ColorMode>\n"
-        "<scan:XResolution>%d</scan:XResolution>\n"
-        "<scan:YResolution>%d</scan:YResolution>\n"
-        "<pwg:DocumentFormat>%s</pwg:DocumentFormat>\n"
-        "</scan:ScanSettings>\n",
-        size_height_300[size_index], size_width_300[size_index],
-        source_values[source_index], color_value,
-        dpi, dpi,
-        format_mimes[format_index]);
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<scan:ScanSettings xmlns:pwg=\"http://www.pwg.org/schemas/2010/12/sm\" "
+        "xmlns:scan=\"http://schemas.hp.com/imaging/escl/2011/05/03\">"
+        "<pwg:Version>2.0</pwg:Version>"
+        "<pwg:ScanRegions>"
+        "<pwg:ScanRegion>"
+        "<pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>"
+        "<pwg:XOffset>0</pwg:XOffset>"
+        "<pwg:YOffset>0</pwg:YOffset>"
+        "<pwg:Width>%d</pwg:Width>"
+        "<pwg:Height>%d</pwg:Height>"
+        "</pwg:ScanRegion>"
+        "</pwg:ScanRegions>"
+        "<pwg:InputSource>%s</pwg:InputSource>"
+        "<scan:ColorMode>%s</scan:ColorMode>"
+        "<pwg:DocumentFormat>%s</pwg:DocumentFormat>"
+        "%s"
+        "<scan:XResolution>%d</scan:XResolution>"
+        "<scan:YResolution>%d</scan:YResolution>"
+        "</scan:ScanSettings>",
+        size_width_300[size_index], size_height_300[size_index],
+        source_values[source_index], color_value, mime, format_ext,
+        dpi, dpi);
 }
 
 static void do_scan(void) {
