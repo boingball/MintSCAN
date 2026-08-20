@@ -24,6 +24,22 @@ GET  {Location}/NextDocument     -> the scanned page, as the requested
 would mean repeating `NextDocument` until the scanner returns 404 (no
 more pages) - not implemented yet.
 
+`pwg:ScanRegion`'s `pwg:ContentRegionUnits` was missing for a long time
+(only `Height`/`Width`/`XOffset`/`YOffset` were sent) - confirmed by
+testing that a real scanner would accept the job and return a valid
+image while silently ignoring every other requested field (resolution,
+colour mode) and falling back to its own defaults for all of them, no
+matter what was actually requested. That's consistent with a
+strict/fragile firmware parser failing region validation without an
+explicit units element and discarding the rest of the document rather
+than rejecting just that one field. `ContentRegionUnits` is now sent
+(first child of `ScanRegion`, matching its schema sequence), along with
+`scan:Intent` since it's commonly present in working real-world
+requests too. If a scanner still ignores requested values after this,
+`build_scan_settings_xml()`'s "Requesting: ..." status line is the
+place to check the built request actually matches what's expected
+next, rather than guessing at the XML shape again.
+
 ## Discovery
 
 mDNS-SD PTR query for `_uscan._tcp.local` (eSCL over HTTP) and

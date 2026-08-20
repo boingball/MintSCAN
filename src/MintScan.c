@@ -1216,13 +1216,25 @@ static void build_scan_settings_xml(char *buf, int buf_size) {
        which value we picked. */
     printf("Requesting: %d DPI, %s, %s\n", dpi, color_value, source_values[source_index]);
 
+    /* pwg:ScanRegion's schema sequence puts ContentRegionUnits first,
+       before Height/Width/XOffset/YOffset - it was missing entirely
+       here before. Confirmed by testing that a real scanner can accept
+       the job (still returns 201/a valid image) while silently
+       ignoring every other requested field (resolution, colour mode)
+       and falling back to its own defaults for all of them - consistent
+       with a strict/fragile firmware parser failing region validation
+       and discarding the rest of the document rather than just that
+       one field. scan:Intent is likewise commonly present in working
+       real-world requests and cheap to include. */
     snprintf(buf, buf_size,
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         "<scan:ScanSettings xmlns:scan=\"http://schemas.hp.com/imaging/escl/2011/05/03\" "
         "xmlns:pwg=\"http://www.pwg.org/schemas/2010/12/sm\">\n"
         "<pwg:Version>2.0</pwg:Version>\n"
+        "<scan:Intent>Document</scan:Intent>\n"
         "<pwg:ScanRegions>\n"
         "<pwg:ScanRegion>\n"
+        "<pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>\n"
         "<pwg:Height>%d</pwg:Height>\n"
         "<pwg:Width>%d</pwg:Width>\n"
         "<pwg:XOffset>0</pwg:XOffset>\n"
