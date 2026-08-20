@@ -62,3 +62,17 @@ entirely and go straight to `ScannerCapabilities`.
   scanner actually reports it supports.
 - **No saved multi-scanner profiles yet** (MintPRINT's Unit0-7 switcher)
   - just a single `ENV:MintSCAN/Unit0`.
+
+## Why every recv() goes through recv_timeout()
+
+The app is single-threaded, so a `recv()` that never returns freezes the
+whole GUI - confirmed by testing: after a successful scan, the best-effort
+`ScanJobs` `DELETE` cleanup would sit forever in a `while (recv(...) > 0)`
+drain loop against a scanner that never replied to `DELETE` and never
+closed the connection. `SO_RCVTIMEO` is set on every socket, but isn't
+trusted alone to bound `recv()` - same caution the mDNS code already
+applies to UDP sockets, just not every bsdsocket.library stack honours it
+reliably for TCP either. `recv_timeout()` wraps every `recv()` in this
+file with an explicit `WaitSelect`, and `http_delete()` no longer reads a
+response at all (fire-and-forget - the scanner will expire the job on its
+own if the `DELETE` doesn't land).

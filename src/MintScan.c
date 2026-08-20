@@ -605,6 +605,29 @@ static int http_connect(const char *ip, int port) {
     return sockfd;
 }
 
+/* recv() bounded by an explicit WaitSelect rather than trusting
+   SO_RCVTIMEO alone - not every bsdsocket.library stack honours socket
+   receive timeouts reliably (the same caution MintPRINT's own mDNS code
+   applies to UDP sockets). Everything here runs on one thread, so a
+   recv() that never returns freezes the whole GUI - this is what a
+   scanner that stalls mid-response, or holds the connection open
+   without sending more data, was doing before. Returns like recv():
+   >0 bytes, 0 on orderly close, <0 on error or timeout. */
+static ssize_t recv_timeout(int sockfd, char *buf, int len, int timeout_secs) {
+    fd_set readfds;
+    struct timeval tv;
+    long ready;
+
+    drain_gui_events();
+    FD_ZERO(&readfds);
+    FD_SET(sockfd, &readfds);
+    tv.tv_sec = timeout_secs;
+    tv.tv_usec = 0;
+    ready = WaitSelect(sockfd + 1, &readfds, NULL, NULL, &tv, NULL);
+    if (ready <= 0) return -1;
+    return recv(sockfd, buf, len, 0);
+}
+
 /* GET request. On success returns the HTTP status code and leaves the
    response body (headers stripped) in response[]. */
 static int http_get(const char *ip, int port, const char *path,
@@ -630,8 +653,7 @@ static int http_get(const char *ip, int port, const char *path,
     }
 
     while (total < maxlen - 1) {
-        drain_gui_events();
-        ssize_t received = recv(sockfd, response + total, maxlen - 1 - total, 0);
+        ssize_t received = recv_timeout(sockfd, response + total, maxlen - 1 - total, 8);
         if (received > 0) {
             total += received;
             response[total] = '\0';
@@ -682,8 +704,7 @@ static int http_post_xml(const char *ip, int port, const char *path,
     }
 
     while (total < (int)sizeof(response) - 1) {
-        drain_gui_events();
-        ssize_t received = recv(sockfd, response + total, sizeof(response) - 1 - total, 0);
+        ssize_t received = recv_timeout(sockfd, response + total, sizeof(response) - 1 - total, 8);
         if (received > 0) {
             total += received;
             response[total] = '\0';
@@ -721,15 +742,19 @@ static int http_post_xml(const char *ip, int port, const char *path,
 static void http_delete(const char *ip, int port, const char *path) {
     int sockfd;
     char header[512];
-    char discard[256];
 
     sockfd = http_connect(ip, port);
     if (sockfd < 0) return;
 
+    /* Fire-and-forget: we don't care about the response, and some
+       scanners never reply to DELETE or never close the connection
+       afterwards - reading a response here previously meant recv()
+       could block the whole (single-threaded) GUI indefinitely. Just
+       send the request and close; the scanner will time the job out
+       on its own if this doesn't land. */
     snprintf(header, sizeof(header),
              "DELETE %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, ip);
     send(sockfd, header, strlen(header), 0);
-    while (recv(sockfd, discard, sizeof(discard), 0) > 0) { /* drain */ }
     CloseSocket(sockfd);
 }
 
@@ -792,8 +817,7 @@ static BOOL download_next_document(const char *ip, int port, const char *job_pat
 
     for (;;) {
         ssize_t received;
-        drain_gui_events();
-        received = recv(sockfd, chunk, sizeof(chunk), 0);
+        received = recv_timeout(sockfd, chunk, sizeof(chunk), 8);
         if (received <= 0) break;
 
         if (!header_done) {
