@@ -107,10 +107,12 @@ static struct Gadget *glist = NULL;
 static struct Screen *screen = NULL;
 static void *vi = NULL;
 static struct TextFont *font = NULL;
-static struct Library *SocketBase = NULL;
-static struct Library *GadToolsBase = NULL;
-static struct IntuitionBase *IntuitionBase = NULL;
-static struct GfxBase *GfxBase = NULL;
+/* Not static: proto/*.h already declares these extern (non-static) - this
+   is the actual definition, matching MintPRINT's own convention. */
+struct Library *SocketBase = NULL;
+struct Library *GadToolsBase = NULL;
+struct IntuitionBase *IntuitionBase = NULL;
+struct GfxBase *GfxBase = NULL;
 static BOOL operation_in_progress = FALSE;
 
 static struct TextAttr Topaz80 = { (STRPTR)"topaz.font", 8, 0, 0 };
@@ -155,7 +157,7 @@ static void redraw_output_box(void) {
         int y = top + (i * line_height) + font->tf_Baseline;
         Move(rp, OUTPUT_LEFT, y);
         SetAPen(rp, 1);
-        Text(rp, output_buffer[start_line + i], strlen(output_buffer[start_line + i]));
+        Text(rp, (CONST_STRPTR)output_buffer[start_line + i], strlen(output_buffer[start_line + i]));
     }
 }
 
@@ -294,7 +296,7 @@ static void load_config(void) {
     if (!file) file = Open((CONST_STRPTR)"ENVARC:MintSCAN/Unit0", MODE_OLDFILE);
     if (!file) return;
 
-    while (FGets(file, line, sizeof(line))) {
+    while (FGets(file, (STRPTR)line, sizeof(line))) {
         char *value;
         trim_config_line(line);
         if (!line[0] || line[0] == '#') continue;
@@ -484,11 +486,11 @@ static void rebuild_scanner_dropdown(void) {
     for (i = 0; i < discovered_count && i < MAX_DISCOVERY_RESULTS; i++) {
         strncpy(scanner_label_storage[i], discovered[i].label, sizeof(scanner_label_storage[i]) - 1);
         scanner_label_storage[i][sizeof(scanner_label_storage[i]) - 1] = '\0';
-        scanner_label_ptrs[i] = scanner_label_storage[i];
+        scanner_label_ptrs[i] = (STRPTR)scanner_label_storage[i];
     }
     if (discovered_count == 0) {
         strncpy(scanner_label_storage[0], unset_label, sizeof(scanner_label_storage[0]) - 1);
-        scanner_label_ptrs[0] = scanner_label_storage[0];
+        scanner_label_ptrs[0] = (STRPTR)scanner_label_storage[0];
         scanner_label_ptrs[1] = NULL;
     } else {
         scanner_label_ptrs[discovered_count] = NULL;
@@ -512,11 +514,13 @@ static void select_discovered_scanner(int idx) {
 static int http_connect(const char *ip, int port) {
     int sockfd;
     struct sockaddr_in serv_addr;
-    struct timeval timeout = { 8, 0 };
+    struct timeval timeout;
 
     sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sockfd < 0) return -1;
 
+    timeout.tv_sec = 8;
+    timeout.tv_usec = 0;
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) < 0) {
         CloseSocket(sockfd);
         return -1;
@@ -610,7 +614,7 @@ static int http_post_xml(const char *ip, int port, const char *path,
              path, ip, (int)strlen(body_in));
 
     if (send(sockfd, header, strlen(header), 0) < 0 ||
-        send(sockfd, body_in, strlen(body_in), 0) < 0) {
+        send(sockfd, (char *)body_in, strlen(body_in), 0) < 0) {
         CloseSocket(sockfd);
         return -1;
     }
@@ -1070,7 +1074,7 @@ static void process_window_events(struct Window *win) {
                                 ULONG selected = 0;
                                 struct Gadget *mg;
                                 operation_in_progress = TRUE;
-                                GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &selected, TAG_DONE);
+                                GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&selected, TAG_DONE);
                                 select_discovered_scanner((int)selected);
                                 if (scanner_host[0]) query_capabilities(scanner_host, scanner_port);
                                 mg = find_model_gadget(win);
@@ -1103,31 +1107,31 @@ static void process_window_events(struct Window *win) {
                             break;
                         case GAD_SOURCE_DROPDOWN: {
                             ULONG v = 0;
-                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &v, TAG_DONE);
+                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&v, TAG_DONE);
                             source_index = (int)v;
                             break;
                         }
                         case GAD_COLOR_DROPDOWN: {
                             ULONG v = 0;
-                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &v, TAG_DONE);
+                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&v, TAG_DONE);
                             color_index = (int)v;
                             break;
                         }
                         case GAD_DPI_DROPDOWN: {
                             ULONG v = 0;
-                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &v, TAG_DONE);
+                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&v, TAG_DONE);
                             dpi_index = (int)v;
                             break;
                         }
                         case GAD_FORMAT_DROPDOWN: {
                             ULONG v = 0;
-                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &v, TAG_DONE);
+                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&v, TAG_DONE);
                             format_index = (int)v;
                             break;
                         }
                         case GAD_SIZE_DROPDOWN: {
                             ULONG v = 0;
-                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, &v, TAG_DONE);
+                            GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&v, TAG_DONE);
                             size_index = (int)v;
                             break;
                         }
@@ -1184,20 +1188,20 @@ static struct Gadget *find_model_gadget(struct Window *win) {
 int main(void) {
     UWORD topborder;
 
-    IntuitionBase = (struct IntuitionBase *)OpenLibrary("intuition.library", 39);
+    IntuitionBase = (struct IntuitionBase *)OpenLibrary((CONST_STRPTR)"intuition.library", 39);
     if (!IntuitionBase) return 1;
 
-    GfxBase = (struct GfxBase *)OpenLibrary("graphics.library", 39);
+    GfxBase = (struct GfxBase *)OpenLibrary((CONST_STRPTR)"graphics.library", 39);
     if (!GfxBase) { CloseLibrary((struct Library *)IntuitionBase); return 1; }
 
-    GadToolsBase = OpenLibrary("gadtools.library", 39);
+    GadToolsBase = OpenLibrary((CONST_STRPTR)"gadtools.library", 39);
     if (!GadToolsBase) {
         CloseLibrary((struct Library *)GfxBase);
         CloseLibrary((struct Library *)IntuitionBase);
         return 1;
     }
 
-    SocketBase = OpenLibrary("bsdsocket.library", 0);
+    SocketBase = OpenLibrary((CONST_STRPTR)"bsdsocket.library", 0);
     if (!SocketBase) {
         CloseLibrary(GadToolsBase);
         CloseLibrary((struct Library *)GfxBase);
