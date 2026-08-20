@@ -89,8 +89,19 @@ static BOOL have_capabilities = FALSE;
 static STRPTR source_labels[] = { (STRPTR)"Flatbed", (STRPTR)"Feeder (ADF)", NULL };
 static const char *source_values[] = { "Platen", "Feeder" };
 
-static STRPTR color_labels[] = { (STRPTR)"Colour", (STRPTR)"Grayscale", (STRPTR)"Black & White", NULL };
-static const char *color_values[] = { "RGB24", "Grayscale8", "BlackAndWhite1" };
+/* Master list of eSCL colour modes this GUI knows about. Colour options
+   start as this full set, but get filtered down to whatever the scanner
+   actually advertises in ScannerCapabilities the first time a query
+   succeeds - see update_color_options_from_capabilities(). Same failure
+   mode as DPI: a ColorMode the scanner doesn't support can get silently
+   substituted rather than rejected. */
+#define COLOR_MODE_COUNT 3
+static const char *color_all_labels[COLOR_MODE_COUNT] = { "Colour", "Grayscale", "Black & White" };
+static const char *color_all_values[COLOR_MODE_COUNT] = { "RGB24", "Grayscale8", "BlackAndWhite1" };
+
+static STRPTR color_option_labels[COLOR_MODE_COUNT + 1];
+static int color_option_master[COLOR_MODE_COUNT] = { 0, 1, 2 }; /* index into color_all_* */
+static int color_option_count = COLOR_MODE_COUNT;
 
 /* DPI options start as this fixed guess, but get replaced with whatever
    the scanner actually advertises in ScannerCapabilities the first time
@@ -105,12 +116,13 @@ static STRPTR dpi_option_labels[MAX_DPI_OPTIONS + 1];
 
 static STRPTR format_labels[] = { (STRPTR)"JPEG", (STRPTR)"PNG", (STRPTR)"PDF", NULL };
 static const char *format_mimes[] = { "image/jpeg", "image/png", "application/pdf" };
+static const char *format_extensions[] = { "jpg", "png", "pdf" };
 
 /* Region sizes in eSCL's units: hundredths of an inch at 300 units/inch
    regardless of scan resolution (per the eSCL spec's ScanRegions). */
-static STRPTR size_labels[] = { (STRPTR)"A4", (STRPTR)"Letter", (STRPTR)"Legal", NULL };
-static const int size_width_300[]  = { 2480, 2550, 2550 };
-static const int size_height_300[] = { 3507, 3300, 4200 };
+static STRPTR size_labels[] = { (STRPTR)"A4", (STRPTR)"Letter", (STRPTR)"Legal", (STRPTR)"A3", NULL };
+static const int size_width_300[]  = { 2480, 2550, 2550, 3508 };
+static const int size_height_300[] = { 3507, 3300, 4200, 4961 };
 
 static int source_index = 0;
 static int color_index = 0;
@@ -284,7 +296,7 @@ static BOOL write_config_file(CONST_STRPTR filename) {
     FPuts(file, (STRPTR)line);
     snprintf(line, sizeof(line), "SOURCE=%s\n", source_values[source_index]);
     FPuts(file, (STRPTR)line);
-    snprintf(line, sizeof(line), "COLORMODE=%s\n", color_values[color_index]);
+    snprintf(line, sizeof(line), "COLORMODE=%s\n", color_all_values[color_option_master[color_index]]);
     FPuts(file, (STRPTR)line);
     snprintf(line, sizeof(line), "RESOLUTION=%d\n", dpi_option_values[dpi_index]);
     FPuts(file, (STRPTR)line);
@@ -344,8 +356,12 @@ static void load_config(void) {
             idx = find_label_index(source_values, 2, line + 7);
             if (idx >= 0) source_index = idx;
         } else if (strncmp(line, "COLORMODE=", 10) == 0) {
-            idx = find_label_index(color_values, 3, line + 10);
-            if (idx >= 0) color_index = idx;
+            for (idx = 0; idx < color_option_count; idx++) {
+                if (strcmp(color_all_values[color_option_master[idx]], line + 10) == 0) {
+                    color_index = idx;
+                    break;
+                }
+            }
         } else if (strncmp(line, "RESOLUTION=", 11) == 0) {
             int r = atoi(line + 11);
             for (idx = 0; idx < dpi_option_count; idx++) {
@@ -355,7 +371,7 @@ static void load_config(void) {
             idx = find_label_index(format_mimes, 3, line + 7);
             if (idx >= 0) format_index = idx;
         } else if (strncmp(line, "PAGESIZE=", 9) == 0) {
-            for (idx = 0; idx < 3; idx++) {
+            for (idx = 0; idx < 4; idx++) {
                 if (strcmp((char *)size_labels[idx], line + 9) == 0) { size_index = idx; break; }
             }
         } else if (strncmp(line, "SAVEPATH=", 9) == 0) {
@@ -569,6 +585,45 @@ static void update_dpi_options_from_capabilities(const char *xml) {
     }
 
     rebuild_dpi_dropdown();
+}
+
+static void rebuild_color_dropdown(void) {
+    int i;
+
+    for (i = 0; i < color_option_count; i++) {
+        color_option_labels[i] = (STRPTR)color_all_labels[color_option_master[i]];
+    }
+    color_option_labels[color_option_count] = NULL;
+    if (color_index >= color_option_count) color_index = 0;
+}
+
+/* Filters the Colour dropdown down to whichever of RGB24/Grayscale8/
+   BlackAndWhite1 the scanner's ScannerCapabilities response actually
+   mentions - not scoped to the currently selected Source, same
+   approximation as the DPI scrape above. Leaves the full 3-option set
+   untouched if none of them turn up (e.g. an unrecognised value we
+   don't know the name of), and tries to keep whichever mode was
+   already selected rather than silently resetting it. */
+static void update_color_options_from_capabilities(const char *xml) {
+    int previous_master = color_option_master[color_index];
+    int count = 0;
+    int i;
+
+    for (i = 0; i < COLOR_MODE_COUNT; i++) {
+        if (strstr(xml, color_all_values[i])) {
+            color_option_master[count++] = i;
+        }
+    }
+
+    if (count == 0) return;
+
+    color_option_count = count;
+    color_index = 0;
+    for (i = 0; i < count; i++) {
+        if (color_option_master[i] == previous_master) { color_index = i; break; }
+    }
+
+    rebuild_color_dropdown();
 }
 
 static void rebuild_scanner_dropdown(void) {
@@ -1110,6 +1165,7 @@ static void query_capabilities(const char *ip, int port) {
     }
 
     update_dpi_options_from_capabilities(response);
+    update_color_options_from_capabilities(response);
 
     have_capabilities = TRUE;
     if (scanner_make_model[0]) {
@@ -1140,7 +1196,7 @@ static void build_scan_settings_xml(char *buf, int buf_size) {
         "<pwg:DocumentFormat>%s</pwg:DocumentFormat>\n"
         "</scan:ScanSettings>\n",
         size_height_300[size_index], size_width_300[size_index],
-        source_values[source_index], color_values[color_index],
+        source_values[source_index], color_all_values[color_option_master[color_index]],
         dpi_option_values[dpi_index], dpi_option_values[dpi_index],
         format_mimes[format_index]);
 }
@@ -1211,6 +1267,7 @@ static void do_discover(void) {
 static struct Gadget *find_gadget_by_id(struct Window *win, int id);
 static struct Gadget *find_model_gadget(struct Window *win);
 static struct Gadget *find_dpi_gadget(struct Window *win);
+static struct Gadget *find_color_gadget(struct Window *win);
 static void sync_string_gadget(struct Window *win, int gadget_id, char *dest, int dest_size);
 
 static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWORD topborder) {
@@ -1299,7 +1356,7 @@ static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWOR
     ng.ng_GadgetText = (STRPTR)"Colour:";
     ng.ng_GadgetID = GAD_COLOR_DROPDOWN;
     gad = CreateGadget(CYCLE_KIND, gad, &ng,
-        GTCY_Labels, (ULONG)color_labels, GTCY_Active, color_index, TAG_DONE);
+        GTCY_Labels, (ULONG)color_option_labels, GTCY_Active, color_index, TAG_DONE);
     if (!gad) return NULL;
 
     ng.ng_TopEdge += 20;
@@ -1387,7 +1444,7 @@ static void process_window_events(struct Window *win) {
                         case GAD_SCANNER_DROPDOWN: {
                             if (!operation_in_progress) {
                                 ULONG selected = 0;
-                                struct Gadget *mg, *dg;
+                                struct Gadget *mg, *dg, *cg;
                                 operation_in_progress = TRUE;
                                 GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&selected, TAG_DONE);
                                 select_discovered_scanner((int)selected);
@@ -1403,13 +1460,19 @@ static void process_window_events(struct Window *win) {
                                         GTCY_Labels, (ULONG)dpi_option_labels,
                                         GTCY_Active, (ULONG)dpi_index, TAG_DONE);
                                 }
+                                cg = find_color_gadget(win);
+                                if (cg) {
+                                    GT_SetGadgetAttrs(cg, win, NULL,
+                                        GTCY_Labels, (ULONG)color_option_labels,
+                                        GTCY_Active, (ULONG)color_index, TAG_DONE);
+                                }
                                 operation_in_progress = FALSE;
                             }
                             break;
                         }
                         case GAD_DISCOVER_BUTTON:
                             if (!operation_in_progress) {
-                                struct Gadget *sg, *mg, *dg;
+                                struct Gadget *sg, *mg, *dg, *cg;
                                 operation_in_progress = TRUE;
                                 do_discover();
                                 sg = find_gadget_by_id(win, GAD_SCANNER_DROPDOWN);
@@ -1429,6 +1492,12 @@ static void process_window_events(struct Window *win) {
                                         GTCY_Labels, (ULONG)dpi_option_labels,
                                         GTCY_Active, (ULONG)dpi_index, TAG_DONE);
                                 }
+                                cg = find_color_gadget(win);
+                                if (cg) {
+                                    GT_SetGadgetAttrs(cg, win, NULL,
+                                        GTCY_Labels, (ULONG)color_option_labels,
+                                        GTCY_Active, (ULONG)color_index, TAG_DONE);
+                                }
                                 operation_in_progress = FALSE;
                             }
                             break;
@@ -1440,7 +1509,7 @@ static void process_window_events(struct Window *win) {
                                 sync_string_gadget(win, GAD_IP_STRING, ip_entry_buffer, sizeof(ip_entry_buffer));
                                 if (parse_host_port(ip_entry_buffer, host, sizeof(host), &port)) {
                                     int idx = add_or_select_manual_ip(host, port);
-                                    struct Gadget *sg, *mg, *dg;
+                                    struct Gadget *sg, *mg, *dg, *cg;
                                     query_capabilities(scanner_host, scanner_port);
                                     sg = find_gadget_by_id(win, GAD_SCANNER_DROPDOWN);
                                     if (sg) {
@@ -1458,6 +1527,12 @@ static void process_window_events(struct Window *win) {
                                         GT_SetGadgetAttrs(dg, win, NULL,
                                             GTCY_Labels, (ULONG)dpi_option_labels,
                                             GTCY_Active, (ULONG)dpi_index, TAG_DONE);
+                                    }
+                                    cg = find_color_gadget(win);
+                                    if (cg) {
+                                        GT_SetGadgetAttrs(cg, win, NULL,
+                                            GTCY_Labels, (ULONG)color_option_labels,
+                                            GTCY_Active, (ULONG)color_index, TAG_DONE);
                                     }
                                 } else {
                                     printf("Enter a scanner IP first\n");
@@ -1488,8 +1563,39 @@ static void process_window_events(struct Window *win) {
                         }
                         case GAD_FORMAT_DROPDOWN: {
                             ULONG v = 0;
+                            char *dot, *slash, *colon, *base;
+                            struct Gadget *sg;
+
                             GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&v, TAG_DONE);
                             format_index = (int)v;
+
+                            /* Keep "Save to:" in sync with the chosen
+                               format's extension - otherwise it's easy to
+                               pick PNG/PDF and still write a .jpg filename.
+                               Only replace what's after the rightmost path
+                               separator, so a '.' in a directory name isn't
+                               mistaken for the extension. */
+                            slash = strrchr(savepath_buffer, '/');
+                            colon = strrchr(savepath_buffer, ':');
+                            if (slash && colon) base = (slash > colon) ? slash : colon;
+                            else if (slash) base = slash;
+                            else if (colon) base = colon;
+                            else base = NULL;
+
+                            dot = strrchr(base ? base : savepath_buffer, '.');
+                            if (dot) {
+                                snprintf(dot + 1, sizeof(savepath_buffer) - (size_t)(dot + 1 - savepath_buffer),
+                                         "%s", format_extensions[format_index]);
+                            } else {
+                                size_t len = strlen(savepath_buffer);
+                                snprintf(savepath_buffer + len, sizeof(savepath_buffer) - len,
+                                         ".%s", format_extensions[format_index]);
+                            }
+
+                            sg = find_gadget_by_id(win, GAD_SAVEPATH_STRING);
+                            if (sg) {
+                                GT_SetGadgetAttrs(sg, win, NULL, GTST_String, (ULONG)savepath_buffer, TAG_DONE);
+                            }
                             break;
                         }
                         case GAD_SIZE_DROPDOWN: {
@@ -1552,6 +1658,10 @@ static struct Gadget *find_model_gadget(struct Window *win) {
 
 static struct Gadget *find_dpi_gadget(struct Window *win) {
     return find_gadget_by_id(win, GAD_DPI_DROPDOWN);
+}
+
+static struct Gadget *find_color_gadget(struct Window *win) {
+    return find_gadget_by_id(win, GAD_COLOR_DROPDOWN);
 }
 
 /* GTST_String only sets a string gadget's INITIAL text at creation time -
@@ -1630,6 +1740,7 @@ int main(void) {
     load_config();
     rebuild_scanner_dropdown();
     rebuild_dpi_dropdown();
+    rebuild_color_dropdown();
     if (scanner_host[0]) {
         if (scanner_port != 80) {
             snprintf(ip_entry_buffer, sizeof(ip_entry_buffer), "%s:%d", scanner_host, scanner_port);
