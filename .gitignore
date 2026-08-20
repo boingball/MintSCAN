@@ -1,0 +1,8 @@
+build/
+release/
+MintScan
+*.o
+*.map
+__pycache__/
+escl_capabilities.xml
+scan_probe_output.*

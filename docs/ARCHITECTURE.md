@@ -1,0 +1,128 @@
+# MintSCAN architecture
+
+## Why no driver
+
+MintPRINT needs a `DEVS:Printers/` driver because AmigaOS printing has a
+device abstraction (`printer.device`) that applications already talk to -
+the driver is what translates that into IPP. Scanning has no equivalent
+OS-level device class on classic AmigaOS for a network scanner to plug
+into, so there is nothing to intercept. MintSCAN is just an application
+that speaks eSCL directly and writes the result to a file.
+
+## eSCL flow
+
+```
+GET  /eSCL/ScannerCapabilities   -> capabilities XML (formats, resolutions, MakeAndModel)
+GET  /eSCL/ScannerStatus         -> idle/processing state (not yet used)
+POST /eSCL/ScanJobs              -> ScanSettings XML in, "Location" response header
+                                     out (the new job's URL)
+GET  {Location}/NextDocument     -> the scanned page, as the requested
+                                     DocumentFormat (JPEG/PNG/PDF)
+```
+
+`ScanJobs` is a one-shot job today (single page, flatbed). ADF/multi-page
+would mean repeating `NextDocument` until the scanner returns 404 (no
+more pages) - not implemented yet.
+
+`pwg:ScanRegion`'s `pwg:ContentRegionUnits` was missing for a long time
+(only `Height`/`Width`/`XOffset`/`YOffset` were sent) - confirmed by
+testing that a real scanner would accept the job and return a valid
+image while silently ignoring every other requested field (resolution,
+colour mode) and falling back to its own defaults for all of them, no
+matter what was actually requested. That's consistent with a
+strict/fragile firmware parser failing region validation without an
+explicit units element and discarding the rest of the document rather
+than rejecting just that one field. `ContentRegionUnits` is now sent
+(first child of `ScanRegion`, matching its schema sequence), along with
+`scan:Intent` since it's commonly present in working real-world
+requests too. If a scanner still ignores requested values after this,
+`build_scan_settings_xml()`'s "Requesting: ..." status line is the
+place to check the built request actually matches what's expected
+next, rather than guessing at the XML shape again.
+
+## Discovery
+
+mDNS-SD PTR query for `_uscan._tcp.local` (eSCL over HTTP) and
+`_uscans._tcp.local` (eSCL over HTTPS), sent unicast-response (QU bit
+set) so this never needs to join the 224.0.0.251 multicast group to see
+replies - same shape as MintPRINT's mDNS discovery. Like MintPRINT, this
+deliberately does not decode SRV/TXT records; a reply's source address is
+enough to populate the picker, and `ScannerCapabilities` after selection
+supplies the real details.
+
+eSCL scanners are not reliably discoverable via SSDP the way AirPrint
+printers are, so - unlike MintPRINT - there is no SSDP pass here.
+
+mDNS multicast doesn't reach every environment - notably WinUAE's SLIRP
+networking, which doesn't route 224.0.0.251 (`no route to 224.0.0.251?`
+in the status box). The IP field next to Discover exists for exactly
+this: type an IP (or `ip:port`) and click Query to skip discovery
+entirely and go straight to `ScannerCapabilities`.
+
+## Known limitations / next steps
+
+- **`NextDocument` handles `Content-Length`, `Transfer-Encoding: chunked`,
+  and a server that just closes the connection when done.** The chunked
+  decoder is a plain, tolerant state machine (`chunk_decoder_feed()`) -
+  it doesn't parse trailer headers after the terminating 0-length chunk
+  (rare in practice; most servers send `0\r\n\r\n` and stop).
+- **HTTPS (`_uscans._tcp`) scanners are discovered but not actually
+  reachable** - eSCL-over-TLS needs AmiSSL wired into the HTTP client,
+  which isn't done yet. Plain-HTTP eSCL (`_uscan._tcp`, the common case)
+  works today.
+- **ADF and duplex are not implemented.** `ScanRegions` is always a
+  single full-page region at (0,0); there's no multi-page loop.
+- **`ScannerCapabilities` is only lightly scraped**, not fully parsed.
+  `pwg:MakeAndModel` (for display) comes straight from the raw response.
+  DPI (every `XResolution>NNN<` value) and Colour mode (whichever of
+  RGB24/Grayscale8/BlackAndWhite1 turn up) are scraped from whichever
+  Source is currently selected: `extract_source_block()` pulls out the
+  substring between `<scan:Platen>`/`<scan:Adf>` and its closing tag
+  (matching the Source dropdown) before `scrape_dpi_values()`/
+  `scrape_color_values()` run - a scanner can support different values
+  per source (e.g. higher DPI or colour modes on the ADF but not the
+  flatbed), and scraping the whole document conflated the two, which is
+  exactly why an offered/scraped value could still get silently rejected
+  by the scanner. Falls back to scraping the whole document if the
+  current Source isn't broken out as its own element (some
+  capabilities responses don't split them). Source/Format/Size have no
+  capability check at all.
+
+  **The DPI and Colour dropdowns themselves are always the same fixed
+  list** (`dpi_gui_values`/`color_all_labels`) - they are never rebuilt
+  from what's scraped. An earlier version tried swapping a live CYCLE_KIND
+  gadget's `GTCY_Labels`/`GTCY_Active` after a capabilities query to show
+  only supported values, and testing confirmed this breaks selection
+  entirely: the new labels display, but the gadget's internal
+  active-index tracking desyncs, so what you pick visually stops
+  corresponding to the index the code reads back - values shown but not
+  honoured. This is a known GadTools gotcha MintPRINT itself works
+  around by never live-updating a cycle gadget's label list once
+  created. Instead, `resolve_dpi()`/`resolve_color_value()` (called from
+  `build_scan_settings_xml()`) validate the selected value against what
+  that Source actually scraped and substitute the closest/first
+  supported one if needed. `build_scan_settings_xml()` also always
+  prints exactly what it's about to request (DPI/ColorMode/Source), not
+  just on substitution - if a scanner still ignores an honestly-supported
+  value, that line is the next thing to check, not which value got
+  picked client-side.
+- **Page sizes (A4/Letter/Legal/A3) are a fixed guess, not derived from
+  `MaxWidth`/`MaxHeight`.** A3 was added because a real scanner turned
+  out to support it, not because it's queried - a flatbed too small for
+  A3 would just get a `ScanRegions` request bigger than its bed.
+- **No saved multi-scanner profiles yet** (MintPRINT's Unit0-7 switcher)
+  - just a single `ENV:MintSCAN/Unit0`.
+
+## Why every recv() goes through recv_timeout()
+
+The app is single-threaded, so a `recv()` that never returns freezes the
+whole GUI - confirmed by testing: after a successful scan, the best-effort
+`ScanJobs` `DELETE` cleanup would sit forever in a `while (recv(...) > 0)`
+drain loop against a scanner that never replied to `DELETE` and never
+closed the connection. `SO_RCVTIMEO` is set on every socket, but isn't
+trusted alone to bound `recv()` - same caution the mDNS code already
+applies to UDP sockets, just not every bsdsocket.library stack honours it
+reliably for TCP either. `recv_timeout()` wraps every `recv()` in this
+file with an explicit `WaitSelect`, and `http_delete()` no longer reads a
+response at all (fire-and-forget - the scanner will expire the job on its
+own if the `DELETE` doesn't land).
