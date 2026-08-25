@@ -1,0 +1,150 @@
+Short:        eSCL (AirScan) scanning GUI for classic AmigaOS
+Author:       Darren Banfi (boingball)
+Uploader:     boingball@gmail.com
+Type:         gfx/misc
+Version:      1.0.0
+Requires:     68000+; AmigaOS 3.0+; TCP/IP stack providing bsdsocket.library
+Architecture: m68k-amigaos >= 3.0.0
+
+MintSCAN
+========
+
+MintSCAN lets classic AmigaOS scan from modern network scanners and
+all-in-one printers - the same eSCL/AirScan scanners phones and modern
+computers already use - with no scanner-specific software needed on the
+device side. It is a single GUI application, MintScan, that discovers
+eSCL scanners on the LAN, queries their capabilities, and scans straight
+to a file.
+
+Sibling project to MintPRINT (IPP/AirPrint printing for classic
+AmigaOS) - built the same way, reusing the same bsdsocket networking,
+mDNS discovery and GadTools idioms. Scanning has no AmigaOS "device"
+concept to hook into the way printing has DEVS:Printers/, so there is no
+driver component here - just one GUI program.
+
+Archive contents
+----------------
+
+This archive contains one drawer:
+
+  MintSCAN/
+    MintScan                the GUI application
+
+Features
+--------
+
+  - LAN scanner discovery using mDNS (_uscan._tcp / _uscans._tcp)
+  - eSCL capability query - reads the scanner's supported sources,
+    resolutions, colour modes and document formats
+  - Manual IP entry and Query, for setups mDNS multicast can't reach
+    (e.g. WinUAE's SLIRP networking)
+  - Scans from the flatbed or ADF, in Colour/Grayscale/Black & White,
+    at 100-600 DPI, to JPEG/PNG/PDF, at A4/Letter/Legal/A3
+  - Up to eight saved scanner profiles (Unit0-Unit7), switchable from
+    the GUI - no separate "activate" step, whichever Unit is loaded is
+    what Scan uses next
+  - Scanner make/model shown after a successful query
+  - A retried, timeout-bounded connection to each scanner, so a Wi-Fi
+    scanner that has let its radio doze off between jobs still gets
+    a fair chance to wake up and answer
+  - No scanner-specific Amiga driver or vendor software required
+
+Requirements
+------------
+
+  - Motorola 68000 or later
+  - AmigaOS 3.0 or later
+  - A running TCP/IP stack providing bsdsocket.library. This is
+    required because MintSCAN talks directly to the scanner over IP.
+  - A network scanner or all-in-one printer supporting eSCL
+    (AirScan/AirPrint Scan). Most network scanners and MFPs from
+    roughly the last decade support this.
+
+MintScan performs network discovery and eSCL capability parsing and
+therefore needs a larger stack than small classic Amiga utilities. Use
+the supplied MintScan.info file when launching from Workbench.
+
+Installation
+------------
+
+Extract the archive, copy the MintSCAN drawer wherever you like, and run
+MintScan.
+
+  1. Click Discover to find scanners on the LAN, or type an IP (or
+     "ip:port") next to Discover and click Query.
+  2. Pick a Source, Colour mode, DPI, Format and Page size.
+  3. Set Save to: to where the scanned file should be written.
+  4. Click Scan.
+  5. Click Save Config to remember these settings in the currently
+     selected Unit (Unit0 by default) for next time.
+
+Use the Unit: dropdown to keep separate saved profiles for more than
+one scanner - switching it loads that Unit's saved settings (or
+MintSCAN's defaults, if that Unit has never been saved to).
+
+AmigaOS 3.0/3.1 notes
+----------------------
+
+MintScan targets the same V39/V37-era library requirements as
+MintPRINT's classic driver build, so it is expected to run unmodified
+on AmigaOS 3.0/3.1 as well as later releases - it has had less
+real-hardware testing on 3.0/3.1 specifically than MintPRINT has, so
+reports from that combination are especially welcome.
+
+Reporting a problem
+--------------------
+
+If Query reports that your scanner has no usable capabilities, or a
+scan comes back at the wrong resolution/colour mode or won't open,
+please open an issue at:
+
+  https://github.com/boingball/MintSCAN/issues
+
+and attach the output of windows_escl_probe.py (included in the source
+repository) run against the scanner from a Windows PC on the same
+network:
+
+  python windows_escl_probe.py <scanner-ip> --dpi 400 --color BlackAndWhite1
+
+This helps separate scanner-side eSCL behaviour from Amiga-side
+problems without requiring any Amiga-specific diagnostic tools. Please
+include the AmigaOS version, TCP/IP stack, and the exact
+Source/Colour/DPI/Format/Size options used.
+
+Source Code
+-----------
+
+Source code, build instructions and development history:
+
+  https://github.com/boingball/MintSCAN
+
+License
+-------
+
+MIT License. See the LICENSE file in the source repository for the
+full text - in short, free to use, copy, modify and redistribute,
+including commercially, provided the copyright notice is kept.
+
+Credits
+-------
+
+GUI and eSCL client by Darren Banfi (boingball), developed with
+assistance from Anthropic Claude.
+
+History
+-------
+
+1.0.0  Initial Aminet release.
+
+       - MintScan GUI: discovery, capability query, and single-page
+         scan-to-file over eSCL (ScannerCapabilities / ScanJobs /
+         NextDocument)
+       - mDNS LAN discovery for _uscan._tcp and _uscans._tcp, plus
+         manual IP entry for networks mDNS multicast can't reach
+       - Source/Colour/DPI/Format/Page size selection, validated
+         against the scanner's queried capabilities at scan time
+       - Up to eight saved scanner profiles (Unit0-Unit7)
+       - Timeout-bounded connection with one retry, so scanners that
+         power down their Wi-Fi radio between jobs still get a fair
+         chance to answer
+       - Chunked-transfer-safe document download

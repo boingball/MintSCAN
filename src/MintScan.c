@@ -25,6 +25,8 @@ typedef long ssize_t;
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/ioctl.h> /* FIONBIO - connect_with_timeout() */
+#include <errno.h>     /* EINPROGRESS/EWOULDBLOCK - connect_with_timeout() */
 
 #define USED __attribute__((used))
 
@@ -54,13 +56,25 @@ static const char USED min_stack[] = "$STACK:393216";
 #define GAD_EXIT_BUTTON      12
 #define GAD_IP_STRING        13
 #define GAD_QUERY_BUTTON     14
+#define GAD_UNIT_DROPDOWN    15
+
+#define MINTSCAN_VERSION "1.0.0"
+
+/* Saved scanner profiles: ENV(ARC):MintSCAN/Unit0 .. Unit(MAX_UNITS-1),
+   switched via GAD_UNIT_DROPDOWN - same Unit0-7 idea as MintPRINT's
+   printer profiles. Unlike MintPRINT there is no background driver with
+   its own idea of which Unit is "live" - MintSCAN is the only reader of
+   these files, so whichever Unit is currently loaded in the GUI is simply
+   what Scan uses next; there is no separate Activate step. */
+#define MAX_UNITS 8
+#define UNIT_LABEL_LEN 48
 
 #define MAX_DISCOVERY_RESULTS 16
 #define MAX_DPI_OPTIONS 10
 #define MAX_BUFFER    65536   /* capabilities / ScanJobs response scratch */
 #define MAX_OUTPUT_LINES 8
 #define MAX_OUTPUT_LINE_LENGTH 55
-#define OUTPUT_TOP    245
+#define OUTPUT_TOP    265
 #define OUTPUT_LEFT   10
 #define OUTPUT_LINE_H 10
 #define OUTPUT_RIGHT  (window->Width - 20)
@@ -75,6 +89,12 @@ static int discovered_count = 0;
 static STRPTR scanner_label_ptrs[MAX_DISCOVERY_RESULTS + 1];
 static char scanner_label_storage[MAX_DISCOVERY_RESULTS][80];
 static STRPTR *scanner_dropdown_labels = NULL;
+
+/* The Unit currently loaded/shown in the GUI - see MAX_UNITS above. */
+static int current_unit_index = 0;
+static char unit_label_storage[MAX_UNITS][UNIT_LABEL_LEN];
+static STRPTR unit_label_ptrs[MAX_UNITS + 1];
+static STRPTR *unit_dropdown_labels = NULL;
 
 /* The scanner currently selected in the GUI - may come from discovery,
    or from a saved profile loaded at startup before any Discover click. */
@@ -176,6 +196,13 @@ static struct TextAttr Topaz60 = { (STRPTR)"topaz.font", 6, 0, 0 };
    this may be launched from Workbench, where there is no console. */
 static void custom_printf(const char *format, ...);
 #define printf custom_printf
+
+/* Forward declarations - definition order below follows the eSCL data
+   flow (config -> discovery -> HTTP -> GUI), but the Unit-switching
+   helpers in the config section need these GUI-section functions. */
+static struct Gadget *find_gadget_by_id(struct Window *win, int id);
+static struct Gadget *find_model_gadget(struct Window *win);
+static void rebuild_scanner_dropdown(void);
 
 /* --------------------------------------------------------------------
  * Status output box
@@ -293,14 +320,60 @@ static int find_label_index(const char **values, int count, const char *value) {
     return -1;
 }
 
-static BOOL write_config_file(CONST_STRPTR filename) {
+static void unit_config_path(int idx, BOOL envarc, char *out, int out_size) {
+    snprintf(out, out_size, "%s:MintSCAN/Unit%d", envarc ? "ENVARC" : "ENV", idx);
+}
+
+static BOOL unit_file_exists(int idx) {
+    BPTR lock;
+    char path[64];
+
+    unit_config_path(idx, FALSE, path, sizeof(path));
+    lock = Lock((CONST_STRPTR)path, ACCESS_READ);
+    if (!lock) {
+        unit_config_path(idx, TRUE, path, sizeof(path));
+        lock = Lock((CONST_STRPTR)path, ACCESS_READ);
+    }
+    if (lock) { UnLock(lock); return TRUE; }
+    return FALSE;
+}
+
+/* Peeks just the MODEL= line out of a saved Unit file, without disturbing
+   any of the live GUI state - used to label the Unit dropdown entries. */
+static void peek_unit_model(int idx, char *out, int out_size) {
+    BPTR file;
+    char path[64];
+    char line[192];
+
+    out[0] = '\0';
+    unit_config_path(idx, FALSE, path, sizeof(path));
+    file = Open((CONST_STRPTR)path, MODE_OLDFILE);
+    if (!file) {
+        unit_config_path(idx, TRUE, path, sizeof(path));
+        file = Open((CONST_STRPTR)path, MODE_OLDFILE);
+    }
+    if (!file) return;
+
+    while (FGets(file, (STRPTR)line, sizeof(line))) {
+        trim_config_line(line);
+        if (strncmp(line, "MODEL=", 6) == 0 && line[6]) {
+            strncpy(out, line + 6, out_size - 1);
+            out[out_size - 1] = '\0';
+            break;
+        }
+    }
+    Close(file);
+}
+
+static BOOL write_config_file(CONST_STRPTR filename, int idx) {
     BPTR file;
     char line[256];
 
     file = Open(filename, MODE_NEWFILE);
     if (!file) return FALSE;
 
-    FPuts(file, (STRPTR)"# MintSCAN Unit0 - written by MintScan\n");
+    snprintf(line, sizeof(line), "# MintSCAN Unit%d - written by MintScan\n", idx);
+    FPuts(file, (STRPTR)line);
     snprintf(line, sizeof(line), "HOST=%s\n", scanner_host);
     FPuts(file, (STRPTR)line);
     snprintf(line, sizeof(line), "PORT=%d\n", scanner_port);
@@ -326,6 +399,7 @@ static BOOL write_config_file(CONST_STRPTR filename) {
 
 static BOOL save_config(void) {
     BOOL env_ok, envarc_ok;
+    char env_path[64], envarc_path[64];
 
     if (!ensure_config_dir((CONST_STRPTR)"ENV:MintSCAN")) {
         printf("Could not create ENV:MintSCAN\n");
@@ -336,19 +410,51 @@ static BOOL save_config(void) {
         return FALSE;
     }
 
-    env_ok = write_config_file((CONST_STRPTR)"ENV:MintSCAN/Unit0");
-    envarc_ok = write_config_file((CONST_STRPTR)"ENVARC:MintSCAN/Unit0");
+    unit_config_path(current_unit_index, FALSE, env_path, sizeof(env_path));
+    unit_config_path(current_unit_index, TRUE, envarc_path, sizeof(envarc_path));
+    env_ok = write_config_file((CONST_STRPTR)env_path, current_unit_index);
+    envarc_ok = write_config_file((CONST_STRPTR)envarc_path, current_unit_index);
     return env_ok && envarc_ok;
 }
 
-static void load_config(void) {
-    BPTR file;
-    char line[256];
-    int idx;
+/* Resets every saved field to MintScan's built-in defaults (the same ones
+   the static initialisers above use) - called before loading a Unit so
+   switching to an empty slot doesn't leave the previous Unit's fields
+   lingering in the GUI. */
+static void reset_unit_defaults(void) {
+    scanner_host[0] = '\0';
+    scanner_port = 80;
+    scanner_make_model[0] = '\0';
+    source_index = 0;
+    color_index = 0;
+    dpi_index = 3;
+    format_index = 0;
+    size_index = 0;
+    strncpy(savepath_buffer, "RAM:scan001.jpg", sizeof(savepath_buffer) - 1);
+    savepath_buffer[sizeof(savepath_buffer) - 1] = '\0';
+}
 
-    file = Open((CONST_STRPTR)"ENV:MintSCAN/Unit0", MODE_OLDFILE);
-    if (!file) file = Open((CONST_STRPTR)"ENVARC:MintSCAN/Unit0", MODE_OLDFILE);
-    if (!file) return;
+/* Loads Unit%d (ENV: first, falling back to ENVARC:) into the live
+   scanner_*/source_index/etc. globals, having reset them to defaults
+   first. Returns TRUE if a saved file for that Unit was found, FALSE if
+   it fell back to defaults (an empty/never-saved slot). Does not touch
+   the GUI itself - see apply_unit_to_gadgets() for that. */
+static BOOL load_unit_config(int idx) {
+    BPTR file;
+    char path[64];
+    char line[256];
+    int lidx;
+
+    reset_unit_defaults();
+    discovered_count = 0;
+
+    unit_config_path(idx, FALSE, path, sizeof(path));
+    file = Open((CONST_STRPTR)path, MODE_OLDFILE);
+    if (!file) {
+        unit_config_path(idx, TRUE, path, sizeof(path));
+        file = Open((CONST_STRPTR)path, MODE_OLDFILE);
+    }
+    if (!file) return FALSE;
 
     while (FGets(file, (STRPTR)line, sizeof(line))) {
         char *value;
@@ -366,22 +472,22 @@ static void load_config(void) {
             strncpy(scanner_make_model, line + 6, sizeof(scanner_make_model) - 1);
             scanner_make_model[sizeof(scanner_make_model) - 1] = '\0';
         } else if (strncmp(line, "SOURCE=", 7) == 0) {
-            idx = find_label_index(source_values, 2, line + 7);
-            if (idx >= 0) source_index = idx;
+            lidx = find_label_index(source_values, 2, line + 7);
+            if (lidx >= 0) source_index = lidx;
         } else if (strncmp(line, "COLORMODE=", 10) == 0) {
-            idx = find_label_index(color_all_values, COLOR_MODE_COUNT, line + 10);
-            if (idx >= 0) color_index = idx;
+            lidx = find_label_index(color_all_values, COLOR_MODE_COUNT, line + 10);
+            if (lidx >= 0) color_index = lidx;
         } else if (strncmp(line, "RESOLUTION=", 11) == 0) {
             int r = atoi(line + 11);
-            for (idx = 0; idx < DPI_GUI_COUNT; idx++) {
-                if (dpi_gui_values[idx] == r) { dpi_index = idx; break; }
+            for (lidx = 0; lidx < DPI_GUI_COUNT; lidx++) {
+                if (dpi_gui_values[lidx] == r) { dpi_index = lidx; break; }
             }
         } else if (strncmp(line, "FORMAT=", 7) == 0) {
-            idx = find_label_index(format_mimes, 3, line + 7);
-            if (idx >= 0) format_index = idx;
+            lidx = find_label_index(format_mimes, 3, line + 7);
+            if (lidx >= 0) format_index = lidx;
         } else if (strncmp(line, "PAGESIZE=", 9) == 0) {
-            for (idx = 0; idx < 4; idx++) {
-                if (strcmp((char *)size_labels[idx], line + 9) == 0) { size_index = idx; break; }
+            for (lidx = 0; lidx < 4; lidx++) {
+                if (strcmp((char *)size_labels[lidx], line + 9) == 0) { size_index = lidx; break; }
             }
         } else if (strncmp(line, "SAVEPATH=", 9) == 0) {
             strncpy(savepath_buffer, line + 9, sizeof(savepath_buffer) - 1);
@@ -402,6 +508,122 @@ static void load_config(void) {
         }
         discovered_count = 1;
     }
+    return TRUE;
+}
+
+/* Rebuilds ip_entry_buffer (GAD_IP_STRING's content) from the currently
+   loaded scanner_host/scanner_port - shared by startup and by switching
+   the Unit dropdown, both of which load a new host into those globals
+   and need the manual-entry field to reflect it. */
+static void sync_ip_entry_buffer(void) {
+    if (!scanner_host[0]) { ip_entry_buffer[0] = '\0'; return; }
+    if (scanner_port != 80) {
+        snprintf(ip_entry_buffer, sizeof(ip_entry_buffer), "%s:%d", scanner_host, scanner_port);
+    } else {
+        strncpy(ip_entry_buffer, scanner_host, sizeof(ip_entry_buffer) - 1);
+        ip_entry_buffer[sizeof(ip_entry_buffer) - 1] = '\0';
+    }
+}
+
+/* Rebuilds the Unit dropdown's labels from whatever is currently saved on
+   disk for each slot ("0: Brother MFC-J6930DW", "1 (empty)", ...).
+   Callable before the window exists (win == NULL) to seed the gadget's
+   initial GTCY_Labels, or afterwards to refresh a live gadget - e.g.
+   after Save, in case a freshly-queried model name just got written out. */
+static void refresh_unit_dropdown(struct Window *win) {
+    int i;
+
+    for (i = 0; i < MAX_UNITS; i++) {
+        char model[UNIT_LABEL_LEN];
+
+        unit_label_ptrs[i] = (STRPTR)unit_label_storage[i];
+        model[0] = '\0';
+
+        if (i == current_unit_index && scanner_make_model[0]) {
+            strncpy(model, scanner_make_model, sizeof(model) - 1);
+            model[sizeof(model) - 1] = '\0';
+        } else {
+            peek_unit_model(i, model, sizeof(model));
+        }
+
+        /* The "Unit:" gadget label already says "Unit" - don't repeat it
+           in every entry, a real model name badly needs the width. */
+        if (model[0]) {
+            snprintf(unit_label_storage[i], UNIT_LABEL_LEN, "%d: %s", i, model);
+        } else if (unit_file_exists(i)) {
+            snprintf(unit_label_storage[i], UNIT_LABEL_LEN, "%d", i);
+        } else {
+            snprintf(unit_label_storage[i], UNIT_LABEL_LEN, "%d (empty)", i);
+        }
+    }
+    unit_label_ptrs[MAX_UNITS] = NULL;
+    unit_dropdown_labels = unit_label_ptrs;
+
+    if (win) {
+        struct Gadget *g = find_gadget_by_id(win, GAD_UNIT_DROPDOWN);
+        if (g) {
+            GT_SetGadgetAttrs(g, win, NULL,
+                               GTCY_Labels, (ULONG)unit_dropdown_labels,
+                               GTCY_Active, (ULONG)current_unit_index,
+                               TAG_DONE);
+        }
+    }
+}
+
+/* Pushes every loaded field (scanner_host/source_index/etc., set by
+   load_unit_config()) into its on-screen gadget. Used after switching
+   the Unit dropdown, since GadTools gadgets don't alias these globals
+   for live redraws the way the string buffers get read back from. */
+static void apply_unit_to_gadgets(struct Window *win) {
+    struct Gadget *g;
+
+    rebuild_scanner_dropdown();
+    sync_ip_entry_buffer();
+
+    if ((g = find_gadget_by_id(win, GAD_SCANNER_DROPDOWN))) {
+        GT_SetGadgetAttrs(g, win, NULL,
+            GTCY_Labels, (ULONG)scanner_dropdown_labels, GTCY_Active, 0, TAG_DONE);
+    }
+    if ((g = find_gadget_by_id(win, GAD_IP_STRING))) {
+        GT_SetGadgetAttrs(g, win, NULL, GTST_String, (ULONG)ip_entry_buffer, TAG_DONE);
+    }
+    if ((g = find_model_gadget(win))) {
+        GT_SetGadgetAttrs(g, win, NULL, GTST_String, (ULONG)scanner_make_model, TAG_DONE);
+    }
+    if ((g = find_gadget_by_id(win, GAD_SOURCE_DROPDOWN))) {
+        GT_SetGadgetAttrs(g, win, NULL, GTCY_Active, (ULONG)source_index, TAG_DONE);
+    }
+    if ((g = find_gadget_by_id(win, GAD_COLOR_DROPDOWN))) {
+        GT_SetGadgetAttrs(g, win, NULL, GTCY_Active, (ULONG)color_index, TAG_DONE);
+    }
+    if ((g = find_gadget_by_id(win, GAD_DPI_DROPDOWN))) {
+        GT_SetGadgetAttrs(g, win, NULL, GTCY_Active, (ULONG)dpi_index, TAG_DONE);
+    }
+    if ((g = find_gadget_by_id(win, GAD_FORMAT_DROPDOWN))) {
+        GT_SetGadgetAttrs(g, win, NULL, GTCY_Active, (ULONG)format_index, TAG_DONE);
+    }
+    if ((g = find_gadget_by_id(win, GAD_SIZE_DROPDOWN))) {
+        GT_SetGadgetAttrs(g, win, NULL, GTCY_Active, (ULONG)size_index, TAG_DONE);
+    }
+    if ((g = find_gadget_by_id(win, GAD_SAVEPATH_STRING))) {
+        GT_SetGadgetAttrs(g, win, NULL, GTST_String, (ULONG)savepath_buffer, TAG_DONE);
+    }
+}
+
+/* Reloads everything for current_unit_index: saved Unit%d config and the
+   on-screen gadgets that show it. Used when switching the Unit dropdown. */
+static void reload_current_unit(struct Window *win) {
+    have_capabilities = FALSE;
+    capabilities_xml[0] = '\0';
+
+    if (load_unit_config(current_unit_index)) {
+        printf("Loaded Unit%d\n", current_unit_index);
+    } else {
+        printf("Unit%d is empty - using defaults\n", current_unit_index);
+    }
+
+    refresh_unit_dropdown(win);
+    if (win) apply_unit_to_gadgets(win);
 }
 
 /* --------------------------------------------------------------------
@@ -747,7 +969,69 @@ static int add_or_select_manual_ip(const char *host, int port) {
  * for the streaming-to-file variant used for the scanned image itself.
  * ----------------------------------------------------------------- */
 
-static int http_connect(const char *ip, int port) {
+/* connect() bounded by an explicit non-blocking connect + WaitSelect
+   rather than however long the stack's own blocking connect() feels
+   like taking - same technique as MintPRINT's mp_connect_with_timeout.
+   Returns like connect(): 0 on success, -1 on failure/timeout. */
+static int connect_with_timeout(int sockfd, struct sockaddr_in *addr, int timeout_secs) {
+    long nonblock = 1, block = 0;
+    int rc, connect_errno;
+
+    if (IoctlSocket(sockfd, FIONBIO, (char *)&nonblock) < 0) {
+        /* Non-blocking mode unavailable on this stack - fall back to a
+           plain blocking connect rather than failing outright. */
+        return connect(sockfd, (struct sockaddr *)addr, sizeof(*addr));
+    }
+
+    rc = connect(sockfd, (struct sockaddr *)addr, sizeof(*addr));
+    /* bsdsocket.library does not update the standard C errno global -
+       Errno() is its own error state, read back via proto/bsdsocket.h.
+       Which value it returns for "in progress" on a non-blocking connect
+       isn't standardised across stacks, so both are accepted. */
+    connect_errno = (rc < 0) ? Errno() : 0;
+
+    if (rc < 0 && (connect_errno == EINPROGRESS || connect_errno == EWOULDBLOCK)) {
+        int elapsed_ms = 0;
+        const int chunk_ms = 250;
+        int outcome = -2; /* -2 = still waiting, -1 = failed, 0 = connected */
+
+        while (outcome == -2 && elapsed_ms < timeout_secs * 1000) {
+            fd_set wfds, efds;
+            struct timeval tv;
+            long ready;
+
+            drain_gui_events();
+
+            FD_ZERO(&wfds); FD_SET(sockfd, &wfds);
+            FD_ZERO(&efds); FD_SET(sockfd, &efds);
+            tv.tv_sec = 0;
+            tv.tv_usec = chunk_ms * 1000;
+
+            ready = WaitSelect(sockfd + 1, NULL, &wfds, &efds, &tv, NULL);
+            if (ready > 0 && (FD_ISSET(sockfd, &wfds) || FD_ISSET(sockfd, &efds))) {
+                int so_err = 0;
+                socklen_t optlen = sizeof(so_err);
+                if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, (char *)&so_err, &optlen) == 0) {
+                    outcome = (so_err == 0) ? 0 : -1;
+                } else {
+                    /* getsockopt(SO_ERROR) unsupported on this stack -
+                       write-readiness alone is the best signal available
+                       that the attempt resolved, so trust it. */
+                    outcome = 0;
+                }
+            }
+            elapsed_ms += chunk_ms;
+        }
+
+        if (outcome == -2) outcome = -1; /* timed out */
+        rc = outcome;
+    }
+
+    IoctlSocket(sockfd, FIONBIO, (char *)&block);
+    return rc;
+}
+
+static int http_connect_once(const char *ip, int port) {
     int sockfd;
     struct sockaddr_in serv_addr;
     struct timeval timeout;
@@ -772,10 +1056,25 @@ static int http_connect(const char *ip, int port) {
     }
 
     drain_gui_events();
-    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+    if (connect_with_timeout(sockfd, &serv_addr, 8) < 0) {
         CloseSocket(sockfd);
         return -1;
     }
+    return sockfd;
+}
+
+/* Some Wi-Fi eSCL scanners (matching MintPRINT's HP OfficeJet/Envy IPP
+   findings) let their radio drop into power-save between jobs. mDNS
+   discovery still gets a reply because the radio wakes for multicast
+   traffic, but the first real TCP SYN afterwards can be slow enough to
+   blow past a single connect attempt, even though the same scanner
+   answers almost immediately once its radio is awake. One retry before
+   giving up covers that case; a genuinely dead endpoint fails fast via
+   ECONNREFUSED/host-unreachable well inside the connect timeout either
+   way, so the retry costs it little. */
+static int http_connect(const char *ip, int port) {
+    int sockfd = http_connect_once(ip, port);
+    if (sockfd < 0) sockfd = http_connect_once(ip, port);
     return sockfd;
 }
 
@@ -1355,6 +1654,18 @@ static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWOR
 
     ng.ng_LeftEdge = 100;
     ng.ng_TopEdge = 5 + topborder;
+    ng.ng_Width = 360;
+    ng.ng_Height = 12;
+    ng.ng_GadgetText = (STRPTR)"Unit:";
+    ng.ng_GadgetID = GAD_UNIT_DROPDOWN;
+    gad = CreateGadget(CYCLE_KIND, gad, &ng,
+        GTCY_Labels, (ULONG)unit_dropdown_labels,
+        GTCY_Active, (ULONG)current_unit_index,
+        TAG_DONE);
+    if (!gad) return NULL;
+
+    ng.ng_LeftEdge = 100;
+    ng.ng_TopEdge += 20;
     ng.ng_Width = 250;
     ng.ng_Height = 12;
     ng.ng_GadgetText = (STRPTR)"Scanner:";
@@ -1513,6 +1824,17 @@ static void process_window_events(struct Window *win) {
             switch (imsgClass) {
                 case IDCMP_GADGETUP:
                     switch (gad->GadgetID) {
+                        case GAD_UNIT_DROPDOWN: {
+                            if (!operation_in_progress) {
+                                ULONG selected = 0;
+                                operation_in_progress = TRUE;
+                                GT_GetGadgetAttrs(gad, win, NULL, GTCY_Active, (ULONG)&selected, TAG_DONE);
+                                current_unit_index = (int)selected;
+                                reload_current_unit(win);
+                                operation_in_progress = FALSE;
+                            }
+                            break;
+                        }
                         case GAD_SCANNER_DROPDOWN: {
                             if (!operation_in_progress) {
                                 ULONG selected = 0;
@@ -1654,7 +1976,8 @@ static void process_window_events(struct Window *win) {
                         case GAD_SAVE_BUTTON:
                             sync_string_gadget(win, GAD_SAVEPATH_STRING, savepath_buffer, sizeof(savepath_buffer));
                             if (save_config()) {
-                                printf("Saved to ENV(ARC):MintSCAN/Unit0\n");
+                                printf("Saved to ENV(ARC):MintSCAN/Unit%d\n", current_unit_index);
+                                refresh_unit_dropdown(win);
                             } else {
                                 printf("Save failed\n");
                             }
@@ -1765,16 +2088,10 @@ int main(void) {
 
     topborder = screen->WBorTop + (screen->Font->ta_YSize + 1);
 
-    load_config();
+    load_unit_config(current_unit_index);
+    refresh_unit_dropdown(NULL);
     rebuild_scanner_dropdown();
-    if (scanner_host[0]) {
-        if (scanner_port != 80) {
-            snprintf(ip_entry_buffer, sizeof(ip_entry_buffer), "%s:%d", scanner_host, scanner_port);
-        } else {
-            strncpy(ip_entry_buffer, scanner_host, sizeof(ip_entry_buffer) - 1);
-            ip_entry_buffer[sizeof(ip_entry_buffer) - 1] = '\0';
-        }
-    }
+    sync_ip_entry_buffer();
 
     if (!createAllGadgets(&glist, vi, topborder)) {
         FreeVisualInfo(vi);
@@ -1788,13 +2105,13 @@ int main(void) {
     }
 
     window = OpenWindowTags(NULL,
-        WA_Title, (ULONG)"MintSCAN",
+        WA_Title, (ULONG)"MintSCAN v" MINTSCAN_VERSION,
         WA_Gadgets, (ULONG)glist,
         WA_AutoAdjust, TRUE,
         WA_Width, 480,
         WA_MinWidth, 480,
-        WA_InnerHeight, 340,
-        WA_MinHeight, 340,
+        WA_InnerHeight, 360,
+        WA_MinHeight, 360,
         WA_DragBar, TRUE,
         WA_DepthGadget, TRUE,
         WA_Activate, TRUE,

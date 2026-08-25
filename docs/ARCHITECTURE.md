@@ -110,8 +110,37 @@ entirely and go straight to `ScannerCapabilities`.
   `MaxWidth`/`MaxHeight`.** A3 was added because a real scanner turned
   out to support it, not because it's queried - a flatbed too small for
   A3 would just get a `ScanRegions` request bigger than its bed.
-- **No saved multi-scanner profiles yet** (MintPRINT's Unit0-7 switcher)
-  - just a single `ENV:MintSCAN/Unit0`.
+
+## Saved profiles: Unit0-7
+
+Same idea as MintPRINT's Unit0-7 printer switcher: up to 8 saved scanner
+profiles at `ENV(ARC):MintSCAN/UnitN`, picked with the `Unit:` cycle
+gadget. Unlike MintPRINT there's no background driver with its own idea
+of which Unit is "live" - MintSCAN is the only reader of these files, so
+whichever Unit is currently loaded in the GUI is simply what `Scan` uses
+next; there's no separate Activate step. Switching the dropdown
+(`reload_current_unit()`) resets every field to MintScan's built-in
+defaults, then loads that Unit's saved file over them if one exists -
+so an empty slot doesn't inherit whatever the previous Unit had typed
+into it. The dropdown's own labels (`refresh_unit_dropdown()`) show each
+slot's saved model name, peeked straight off disk without disturbing the
+live GUI state, matching MintPRINT's `peek_unit_model()`/
+`refresh_unit_dropdown()` pair.
+
+## Wi-Fi scanners that sleep between jobs
+
+`http_connect()` bounds every connect attempt with `connect_with_timeout()`
+- a non-blocking `connect()` polled via `WaitSelect()` rather than trusting
+however long the stack's own blocking connect() feels like taking - and
+retries once on failure before giving up. This is the same fix MintPRINT
+shipped for HP OfficeJet/Envy-class Wi-Fi printers that drop their radio
+into power-save between jobs: mDNS discovery still gets a reply because
+the radio wakes for multicast traffic, but the first real TCP SYN
+afterwards can be slow enough to blow past a single connect attempt even
+though the same device answers almost immediately once its radio is
+awake. A genuinely dead endpoint still fails fast via
+ECONNREFUSED/host-unreachable well inside the timeout, so the retry
+costs little.
 
 ## Why every recv() goes through recv_timeout()
 
