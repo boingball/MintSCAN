@@ -1,6 +1,8 @@
-# MintSCAN saved scanner profile - lives at ENV:MintSCAN/Unit0 (and
-# ENVARC:MintSCAN/Unit0 for persistence across reboots). Written by
-# MintScan's Save button; this file just documents the format.
+# MintSCAN saved scanner profile - lives at ENV:MintSCAN/UnitN (and
+# ENVARC:MintSCAN/UnitN for persistence across reboots), where N is
+# 0-7, one of the eight profiles switchable from the Unit: dropdown.
+# Written by MintScan's Save Config button; this file just documents
+# the format.
 HOST=192.168.1.50
 PORT=80
 MODEL=Example MFC-1234DW
