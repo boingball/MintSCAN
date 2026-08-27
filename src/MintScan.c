@@ -189,8 +189,8 @@ static struct Gadget *glist = NULL;
 static struct Screen *screen = NULL;
 static void *vi = NULL;
 static struct TextFont *font = NULL;
-/* Not static: proto/*.h already declares these extern (non-static) - this
-   is the actual definition, matching MintPRINT's own convention. */
+/* Not static: proto/ headers already declare these extern (non-static) -
+   this is the actual definition, matching MintPRINT's own convention. */
 struct Library *SocketBase = NULL;
 struct Library *GadToolsBase = NULL;
 struct IntuitionBase *IntuitionBase = NULL;
@@ -444,7 +444,7 @@ static void reset_unit_defaults(void) {
 }
 
 /* Loads Unit%d (ENV: first, falling back to ENVARC:) into the live
-   scanner_*/source_index/etc. globals, having reset them to defaults
+   scanner_host/source_index/etc. globals, having reset them to defaults
    first. Returns TRUE if a saved file for that Unit was found, FALSE if
    it fell back to defaults (an empty/never-saved slot). Does not touch
    the GUI itself - see apply_unit_to_gadgets() for that. */
