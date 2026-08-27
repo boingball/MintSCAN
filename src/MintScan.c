@@ -1983,7 +1983,7 @@ static void do_browse_savepath(struct Window *win) {
     }
 
     leaf = FilePart((STRPTR)savepath_buffer);
-    dirlen = (int)(leaf - savepath_buffer);
+    dirlen = (int)((char *)leaf - savepath_buffer);
     if (dirlen >= (int)sizeof(dir_buf)) dirlen = sizeof(dir_buf) - 1;
     memcpy(dir_buf, savepath_buffer, dirlen);
     dir_buf[dirlen] = '\0';
