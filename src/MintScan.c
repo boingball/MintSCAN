@@ -2188,7 +2188,16 @@ static void process_window_events(struct Window *win) {
                             if (!operation_in_progress) {
                                 operation_in_progress = TRUE;
                                 sync_string_gadget(win, GAD_SAVEPATH_STRING, savepath_buffer, sizeof(savepath_buffer));
+                                /* operation_in_progress already blocks a
+                                   second click from doing anything (clicks
+                                   during a scan get drained/ignored by
+                                   drain_gui_events()), but the button still
+                                   looked clickable through the whole
+                                   ScanJobs/NextDocument round trip - grey it
+                                   out so it visibly reflects that. */
+                                GT_SetGadgetAttrs(gad, win, NULL, GA_Disabled, TRUE, TAG_DONE);
                                 do_scan();
+                                GT_SetGadgetAttrs(gad, win, NULL, GA_Disabled, FALSE, TAG_DONE);
                                 operation_in_progress = FALSE;
                             }
                             break;
