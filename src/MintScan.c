@@ -62,7 +62,7 @@ static const char USED min_stack[] = "$STACK:393216";
 #define GAD_STATUS_DISPLAY   16
 #define GAD_BROWSE_BUTTON    17
 
-#define MINTSCAN_VERSION "1.2.0"
+#define MINTSCAN_VERSION "1.2.1"
 
 /* Saved scanner profiles: ENV(ARC):MintSCAN/Unit0 .. Unit(MAX_UNITS-1),
    switched via GAD_UNIT_DROPDOWN - same Unit0-7 idea as MintPRINT's
@@ -1626,10 +1626,27 @@ static BOOL source_uses_document_format_ext(void) {
 
 static void build_scan_settings_xml(char *buf, int buf_size) {
     int dpi = resolve_dpi();
-    const char *color_value = resolve_color_value();
     const char *mime = format_mimes[format_index];
+    const char *color_value = resolve_color_value();
     BOOL use_document_format_ext = source_uses_document_format_ext();
     char format_ext[128];
+
+    /* JPEG has no way to represent 1-bit-per-pixel data (8 bits is its
+       minimum sample depth per component). A scanner asked for
+       BlackAndWhite1 + JPEG together may not reject the job outright
+       rather than fail cleanly - a real-hardware report against this
+       combination came back as a JPEG roughly 1/8th the expected width,
+       consistent with the packed 1-bit bytes (8 real pixels per byte)
+       being written straight through as if each byte were one 8-bit
+       greyscale sample, instead of being unpacked first. Force
+       Grayscale8 for this one format - the narrowest encoding JPEG
+       actually supports - since there's no valid combination to fall
+       back to otherwise. PNG and PDF (see the Format dropdown) can both
+       hold a real 1-bit image if Black & White specifically matters. */
+    if (strcmp(color_value, "BlackAndWhite1") == 0 && strcmp(mime, "image/jpeg") == 0) {
+        printf("Black & White isn't valid in JPEG (min. 8-bit) - using Grayscale instead\n");
+        color_value = "Grayscale8";
+    }
 
     format_ext[0] = '\0';
     if (use_document_format_ext) {

@@ -36,6 +36,27 @@ AmigaOS "device" concept to hook into the way printing has
 `DEVS:Printers/`, so there is no driver component here - just one GUI
 program.
 
+## What's new in 1.2.1
+
+- **Grey the Scan button out while a scan is running**, re-enabling once
+  it returns.
+- **Fixed a build error** in the new "Browse" file requester code
+  (`FilePart()` returns `STRPTR`/`unsigned char *`; `savepath_buffer` is
+  `char *` - GCC won't subtract pointers to different base types even
+  though both are single-byte) - caught on a real `m68k-amigaos-gcc`
+  build.
+- **Black & White + JPEG no longer produces a badly squashed scan.**
+  JPEG can't represent 1-bit-per-pixel data at all (8 bits is its
+  minimum sample depth); asking a scanner for `BlackAndWhite1` with
+  `image/jpeg` anyway got a real report back of a JPEG roughly 1/8th
+  the expected width, consistent with the scanner writing packed 1-bit
+  bytes straight through as 8-bit samples instead of unpacking them
+  first. `build_scan_settings_xml()` now substitutes Grayscale for that
+  one format combination and says so - same "if the scanner still
+  ignores this, the request is what to check next" logging style
+  already used for unsupported DPI/Colour values. PNG and PDF can both
+  hold a real 1-bit image if Black & White specifically matters.
+
 ## What's new in 1.2.0
 
 MintSCAN 1.2.0 fixes a build-breaking typo caught on a real

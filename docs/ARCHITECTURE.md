@@ -110,6 +110,16 @@ entirely and go straight to `ScannerCapabilities`.
   `MaxWidth`/`MaxHeight`.** A3 was added because a real scanner turned
   out to support it, not because it's queried - a flatbed too small for
   A3 would just get a `ScanRegions` request bigger than its bed.
+- **Black & White (`BlackAndWhite1`) is forced to Grayscale when Format
+  is JPEG.** JPEG has no 1-bit-per-pixel encoding at all (8 bits is its
+  minimum sample depth), and asking a scanner for that combination
+  anyway isn't guaranteed to fail cleanly - a real report came back as a
+  JPEG roughly 1/8th the expected width, consistent with 1-bit packed
+  bytes (8 real pixels each) being written straight through as 8-bit
+  samples rather than unpacked first. `build_scan_settings_xml()`
+  substitutes Grayscale8 for JPEG specifically and logs it, the same way
+  an unsupported DPI/Colour value gets substituted and logged elsewhere.
+  PNG and PDF aren't affected - both can hold a real 1-bit image.
 
 ## Saved profiles: Unit0-7
 
