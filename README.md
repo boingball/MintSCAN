@@ -36,6 +36,42 @@ AmigaOS "device" concept to hook into the way printing has
 `DEVS:Printers/`, so there is no driver component here - just one GUI
 program.
 
+## What's new in 1.2.0
+
+MintSCAN 1.2.0 fixes a build-breaking typo caught on a real
+`m68k-amigaos-gcc` build, then follows up on the first real-hardware
+screenshot of 1.1.0 with a GUI pass and a file requester.
+
+- **Fixed a pre-existing comment bug that broke the real cross-compiler
+  build.** A doc comment above `load_unit_config()` read
+  `scanner_*/source_index` - the literal `*/` closed the block comment
+  early, so everything from there through the function body was parsed
+  as stray C tokens instead of a comment. That's what caused the syntax
+  error plus the "implicit declaration of `load_unit_config`" and
+  "defined but not used" warnings for `reset_unit_defaults`/
+  `find_label_index` (all three are only reachable from inside
+  `load_unit_config`, whose body the parser never actually saw).
+- **"Browse" file requester on Save to.** `do_browse_savepath()` opens a
+  standard ASL file requester (pre-seeded from the current path via
+  `FilePart()`/`AddPart()`) instead of requiring a hand-typed AmigaDOS
+  path. Optional at runtime - if `asl.library` doesn't open, the button
+  just says so rather than the app refusing to start.
+- **Model and Status are plain text now, not greyed-out fields.** Both
+  were disabled `STRING_KIND` gadgets, which this render as a
+  hatched/dimmed box reading as "unavailable" - switched to `TEXT_KIND`
+  (matching MintPRINT's own Printer Model display).
+- **Status now shows on load**, not just after the first Discover/Query -
+  a saved Unit's scanner gets queried once the window opens.
+- **Scanner dropdown no longer overflows.** Its label included the model
+  name ("192.168.0.71 (Brother MFC-J6930DW)"), long enough to run behind
+  the Discover button - dropped, since Model right below it already
+  shows the same name.
+- **DPI/Format/Size moved into a second column** beside Source/Colour,
+  balancing the window's width instead of stacking five dropdowns above
+  a mostly-empty right half - shortens the form by two rows, most of
+  which went into tightening the gap above the status box (was noticeably
+  loose in the 1.1.0 screenshot).
+
 ## What's new in 1.1.0
 
 MintSCAN 1.1.0 closes the one remaining gap from the MintPRINT-learnings

@@ -13,6 +13,8 @@
 #include <proto/intuition.h>
 #include <proto/gadtools.h>
 #include <proto/graphics.h>
+#include <proto/asl.h>
+#include <libraries/asl.h>
 typedef long ssize_t;
 #include <clib/alib_protos.h>
 #include <proto/bsdsocket.h>
@@ -58,8 +60,9 @@ static const char USED min_stack[] = "$STACK:393216";
 #define GAD_QUERY_BUTTON     14
 #define GAD_UNIT_DROPDOWN    15
 #define GAD_STATUS_DISPLAY   16
+#define GAD_BROWSE_BUTTON    17
 
-#define MINTSCAN_VERSION "1.1.0"
+#define MINTSCAN_VERSION "1.2.0"
 
 /* Saved scanner profiles: ENV(ARC):MintSCAN/Unit0 .. Unit(MAX_UNITS-1),
    switched via GAD_UNIT_DROPDOWN - same Unit0-7 idea as MintPRINT's
@@ -75,7 +78,7 @@ static const char USED min_stack[] = "$STACK:393216";
 #define MAX_BUFFER    65536   /* capabilities / ScanJobs response scratch */
 #define MAX_OUTPUT_LINES 8
 #define MAX_OUTPUT_LINE_LENGTH 55
-#define OUTPUT_TOP    285
+#define OUTPUT_TOP    259
 #define OUTPUT_LEFT   10
 #define OUTPUT_LINE_H 10
 #define OUTPUT_RIGHT  (window->Width - 20)
@@ -195,6 +198,10 @@ struct Library *SocketBase = NULL;
 struct Library *GadToolsBase = NULL;
 struct IntuitionBase *IntuitionBase = NULL;
 struct GfxBase *GfxBase = NULL;
+/* Optional, unlike the libraries above: the "Browse" file requester just
+   doesn't offer itself (see GAD_BROWSE_BUTTON) if this is NULL, rather
+   than the app refusing to start over a nice-to-have. */
+struct Library *AslBase = NULL;
 static BOOL operation_in_progress = FALSE;
 
 static struct TextAttr Topaz80 = { (STRPTR)"topaz.font", 8, 0, 0 };
@@ -508,13 +515,13 @@ static BOOL load_unit_config(int idx) {
     if (scanner_host[0]) {
         strncpy(discovered[0].ip, scanner_host, sizeof(discovered[0].ip) - 1);
         discovered[0].ip[sizeof(discovered[0].ip) - 1] = '\0';
-        if (scanner_make_model[0]) {
-            snprintf(discovered[0].label, sizeof(discovered[0].label),
-                     "%s (%s)", scanner_host, scanner_make_model);
-        } else {
-            snprintf(discovered[0].label, sizeof(discovered[0].label),
-                     "%s (saved)", scanner_host);
-        }
+        /* Just the IP, not "IP (Model)" - the Model field right below the
+           Scanner dropdown already shows the model name, and the combined
+           label was long enough (a real make/model easily runs past 20
+           characters) to get clipped behind the Discover button in the
+           cycle gadget's fixed-width box. */
+        snprintf(discovered[0].label, sizeof(discovered[0].label),
+                 "%s (saved)", scanner_host);
         discovered_count = 1;
     }
     return TRUE;
@@ -597,7 +604,7 @@ static void apply_unit_to_gadgets(struct Window *win) {
         GT_SetGadgetAttrs(g, win, NULL, GTST_String, (ULONG)ip_entry_buffer, TAG_DONE);
     }
     if ((g = find_model_gadget(win))) {
-        GT_SetGadgetAttrs(g, win, NULL, GTST_String, (ULONG)scanner_make_model, TAG_DONE);
+        GT_SetGadgetAttrs(g, win, NULL, GTTX_Text, (ULONG)scanner_make_model, TAG_DONE);
     }
     refresh_status_gadget();
     if ((g = find_gadget_by_id(win, GAD_SOURCE_DROPDOWN))) {
@@ -1526,7 +1533,7 @@ static BOOL download_next_document(const char *ip, int port, const char *job_pat
 static void refresh_status_gadget(void) {
     struct Gadget *g = find_gadget_by_id(window, GAD_STATUS_DISPLAY);
     if (g) {
-        GT_SetGadgetAttrs(g, window, NULL, GTST_String, (ULONG)scanner_status_text, TAG_DONE);
+        GT_SetGadgetAttrs(g, window, NULL, GTTX_Text, (ULONG)scanner_status_text, TAG_DONE);
     }
 }
 
@@ -1812,77 +1819,101 @@ static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWOR
     if (!gad) return NULL;
     ng.ng_Flags = NG_HIGHLABEL;
 
+    /* Model and Status are read-only display, not editable fields - a
+       plain TEXT_KIND label (like MintPRINT's own Printer Model gadget)
+       instead of a disabled STRING_KIND, which this NDK/theme renders as
+       a hatched/greyed-out box that reads as "unavailable" rather than
+       "here's the answer". GT_SetGadgetAttrs's GTTX_Text updates a live
+       TEXT_KIND gadget's text the same way GTST_String updates a live
+       STRING_KIND one. */
     ng.ng_LeftEdge = 100;
     ng.ng_TopEdge += 20;
     ng.ng_Width = 350;
-    ng.ng_Height = 14;
+    ng.ng_Height = 12;
     ng.ng_GadgetText = (STRPTR)"Model:";
     ng.ng_GadgetID = GAD_MODEL_DISPLAY;
-    gad = CreateGadget(STRING_KIND, gad, &ng,
-        GTST_String, (ULONG)scanner_make_model,
-        GTST_MaxChars, sizeof(scanner_make_model) - 1,
-        GA_Disabled, TRUE,
+    gad = CreateGadget(TEXT_KIND, gad, &ng,
+        GTTX_Text, (ULONG)scanner_make_model,
+        GTTX_Justification, GTJ_LEFT,
         TAG_DONE);
     if (!gad) return NULL;
 
-    /* Live /eSCL/ScannerStatus device state (Idle/Processing/.../Down) -
-       same disabled-string-display idiom as Model above, refreshed by
-       refresh_status_gadget() whenever query_scanner_status() runs. */
+    /* Live /eSCL/ScannerStatus device state (Idle/Processing/.../Down),
+       refreshed by refresh_status_gadget() whenever query_scanner_status()
+       runs - including once at startup for a saved Unit's scanner, so
+       this isn't blank until the first Discover/Query click. */
     ng.ng_LeftEdge = 100;
     ng.ng_TopEdge += 20;
     ng.ng_Width = 200;
-    ng.ng_Height = 14;
     ng.ng_GadgetText = (STRPTR)"Status:";
     ng.ng_GadgetID = GAD_STATUS_DISPLAY;
-    gad = CreateGadget(STRING_KIND, gad, &ng,
-        GTST_String, (ULONG)scanner_status_text,
-        GTST_MaxChars, sizeof(scanner_status_text) - 1,
-        GA_Disabled, TRUE,
+    gad = CreateGadget(TEXT_KIND, gad, &ng,
+        GTTX_Text, (ULONG)scanner_status_text,
+        GTTX_Justification, GTJ_LEFT,
         TAG_DONE);
     if (!gad) return NULL;
 
+    /* Source/Colour stay in a left column; DPI/Format/Size move to a
+       right column sharing the same rows - mirrors MintPRINT's own
+       paired CYCLE_KIND columns (e.g. Printer Engine/Debug beside
+       Quality/DPI) instead of stacking five dropdowns in one column
+       with the whole right half of the window sitting empty. */
+    {
+        UWORD row1 = ng.ng_TopEdge + 20; /* Source | DPI */
+        UWORD row2 = row1 + 20;          /* Colour | Format */
+        UWORD row3 = row2 + 20;          /* (left blank) | Size */
+
+        ng.ng_LeftEdge = 100;
+        ng.ng_TopEdge = row1;
+        ng.ng_Width = 150;
+        ng.ng_Height = 12;
+        ng.ng_GadgetText = (STRPTR)"Source:";
+        ng.ng_GadgetID = GAD_SOURCE_DROPDOWN;
+        gad = CreateGadget(CYCLE_KIND, gad, &ng,
+            GTCY_Labels, (ULONG)source_labels, GTCY_Active, source_index, TAG_DONE);
+        if (!gad) return NULL;
+
+        ng.ng_LeftEdge = 330;
+        ng.ng_Width = 130;
+        ng.ng_GadgetText = (STRPTR)"DPI:";
+        ng.ng_GadgetID = GAD_DPI_DROPDOWN;
+        gad = CreateGadget(CYCLE_KIND, gad, &ng,
+            GTCY_Labels, (ULONG)dpi_gui_labels, GTCY_Active, dpi_index, TAG_DONE);
+        if (!gad) return NULL;
+
+        ng.ng_LeftEdge = 100;
+        ng.ng_TopEdge = row2;
+        ng.ng_Width = 150;
+        ng.ng_GadgetText = (STRPTR)"Colour:";
+        ng.ng_GadgetID = GAD_COLOR_DROPDOWN;
+        gad = CreateGadget(CYCLE_KIND, gad, &ng,
+            GTCY_Labels, (ULONG)color_all_labels, GTCY_Active, color_index, TAG_DONE);
+        if (!gad) return NULL;
+
+        ng.ng_LeftEdge = 330;
+        ng.ng_Width = 130;
+        ng.ng_GadgetText = (STRPTR)"Format:";
+        ng.ng_GadgetID = GAD_FORMAT_DROPDOWN;
+        gad = CreateGadget(CYCLE_KIND, gad, &ng,
+            GTCY_Labels, (ULONG)format_labels, GTCY_Active, format_index, TAG_DONE);
+        if (!gad) return NULL;
+
+        ng.ng_LeftEdge = 330;
+        ng.ng_TopEdge = row3;
+        ng.ng_Width = 130;
+        ng.ng_GadgetText = (STRPTR)"Size:";
+        ng.ng_GadgetID = GAD_SIZE_DROPDOWN;
+        gad = CreateGadget(CYCLE_KIND, gad, &ng,
+            GTCY_Labels, (ULONG)size_labels, GTCY_Active, size_index, TAG_DONE);
+        if (!gad) return NULL;
+    }
+
+    /* Save-to path plus a "Browse" button that opens an ASL file
+       requester (see GAD_BROWSE_BUTTON below) - typing a full AmigaDOS
+       path by hand was the only option before. */
     ng.ng_LeftEdge = 100;
     ng.ng_TopEdge += 20;
-    ng.ng_Width = 150;
-    ng.ng_Height = 12;
-    ng.ng_GadgetText = (STRPTR)"Source:";
-    ng.ng_GadgetID = GAD_SOURCE_DROPDOWN;
-    gad = CreateGadget(CYCLE_KIND, gad, &ng,
-        GTCY_Labels, (ULONG)source_labels, GTCY_Active, source_index, TAG_DONE);
-    if (!gad) return NULL;
-
-    ng.ng_TopEdge += 20;
-    ng.ng_GadgetText = (STRPTR)"Colour:";
-    ng.ng_GadgetID = GAD_COLOR_DROPDOWN;
-    gad = CreateGadget(CYCLE_KIND, gad, &ng,
-        GTCY_Labels, (ULONG)color_all_labels, GTCY_Active, color_index, TAG_DONE);
-    if (!gad) return NULL;
-
-    ng.ng_TopEdge += 20;
-    ng.ng_Width = 100;
-    ng.ng_GadgetText = (STRPTR)"DPI:";
-    ng.ng_GadgetID = GAD_DPI_DROPDOWN;
-    gad = CreateGadget(CYCLE_KIND, gad, &ng,
-        GTCY_Labels, (ULONG)dpi_gui_labels, GTCY_Active, dpi_index, TAG_DONE);
-    if (!gad) return NULL;
-
-    ng.ng_TopEdge += 20;
-    ng.ng_GadgetText = (STRPTR)"Format:";
-    ng.ng_GadgetID = GAD_FORMAT_DROPDOWN;
-    gad = CreateGadget(CYCLE_KIND, gad, &ng,
-        GTCY_Labels, (ULONG)format_labels, GTCY_Active, format_index, TAG_DONE);
-    if (!gad) return NULL;
-
-    ng.ng_TopEdge += 20;
-    ng.ng_GadgetText = (STRPTR)"Size:";
-    ng.ng_GadgetID = GAD_SIZE_DROPDOWN;
-    gad = CreateGadget(CYCLE_KIND, gad, &ng,
-        GTCY_Labels, (ULONG)size_labels, GTCY_Active, size_index, TAG_DONE);
-    if (!gad) return NULL;
-
-    ng.ng_LeftEdge = 100;
-    ng.ng_TopEdge += 20;
-    ng.ng_Width = 360;
+    ng.ng_Width = 260;
     ng.ng_Height = 14;
     ng.ng_GadgetText = (STRPTR)"Save _to:";
     ng.ng_GadgetID = GAD_SAVEPATH_STRING;
@@ -1894,6 +1925,15 @@ static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWOR
         GACT_RELVERIFY, TRUE,
         TAG_DONE);
     if (!gad) return NULL;
+
+    ng.ng_LeftEdge = 370;
+    ng.ng_Width = 90;
+    ng.ng_GadgetText = (STRPTR)"_Browse";
+    ng.ng_GadgetID = GAD_BROWSE_BUTTON;
+    ng.ng_Flags = 0;
+    gad = CreateGadget(BUTTON_KIND, gad, &ng, GT_Underscore, '_', TAG_DONE);
+    if (!gad) return NULL;
+    ng.ng_Flags = NG_HIGHLABEL;
 
     ng.ng_LeftEdge = 10;
     ng.ng_TopEdge += 30;
@@ -1919,6 +1959,61 @@ static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWOR
     if (!gad) return NULL;
 
     return gad;
+}
+
+/* Opens an ASL file requester pre-seeded from the current Save-to path
+   (FilePart() splits it into a starting drawer/file the same way DOS
+   itself would), and on OK rebuilds savepath_buffer from what was picked
+   via AddPart() (not naive string concatenation - AddPart() knows
+   whether the drawer already ends in '/'/':' and only inserts a
+   separator when it doesn't). Does nothing but report the fact if
+   asl.library never opened - Browse is a convenience on top of typing a
+   path by hand, not a requirement. */
+static void do_browse_savepath(struct Window *win) {
+    struct FileRequester *fr;
+    char dir_buf[108];
+    char file_buf[108];
+    STRPTR leaf;
+    int dirlen;
+    struct Gadget *sg;
+
+    if (!AslBase) {
+        printf("asl.library not available - type a path instead\n");
+        return;
+    }
+
+    leaf = FilePart((STRPTR)savepath_buffer);
+    dirlen = (int)(leaf - savepath_buffer);
+    if (dirlen >= (int)sizeof(dir_buf)) dirlen = sizeof(dir_buf) - 1;
+    memcpy(dir_buf, savepath_buffer, dirlen);
+    dir_buf[dirlen] = '\0';
+    strncpy(file_buf, (char *)leaf, sizeof(file_buf) - 1);
+    file_buf[sizeof(file_buf) - 1] = '\0';
+
+    fr = (struct FileRequester *)AllocAslRequestTags(ASL_FileRequest,
+        ASLFR_TitleText, (ULONG)"Save scan to",
+        ASLFR_InitialDrawer, (ULONG)dir_buf,
+        ASLFR_InitialFile, (ULONG)file_buf,
+        ASLFR_DoSaveMode, TRUE,
+        TAG_DONE);
+    if (!fr) {
+        printf("Could not open file requester\n");
+        return;
+    }
+
+    if (AslRequest(fr, NULL)) {
+        strncpy(savepath_buffer, (char *)fr->rf_Dir, sizeof(savepath_buffer) - 1);
+        savepath_buffer[sizeof(savepath_buffer) - 1] = '\0';
+        AddPart((STRPTR)savepath_buffer, (STRPTR)fr->rf_File, sizeof(savepath_buffer));
+
+        sg = find_gadget_by_id(win, GAD_SAVEPATH_STRING);
+        if (sg) {
+            GT_SetGadgetAttrs(sg, win, NULL, GTST_String, (ULONG)savepath_buffer, TAG_DONE);
+        }
+        printf("Save to: %s\n", savepath_buffer);
+    }
+
+    FreeAslRequest(fr);
 }
 
 static void process_window_events(struct Window *win) {
@@ -1962,7 +2057,7 @@ static void process_window_events(struct Window *win) {
                                 mg = find_model_gadget(win);
                                 if (mg) {
                                     GT_SetGadgetAttrs(mg, win, NULL,
-                                                       GTST_String, (ULONG)scanner_make_model, TAG_DONE);
+                                                       GTTX_Text, (ULONG)scanner_make_model, TAG_DONE);
                                 }
                                 operation_in_progress = FALSE;
                             }
@@ -1982,7 +2077,7 @@ static void process_window_events(struct Window *win) {
                                 mg = find_model_gadget(win);
                                 if (mg) {
                                     GT_SetGadgetAttrs(mg, win, NULL,
-                                                       GTST_String, (ULONG)scanner_make_model, TAG_DONE);
+                                                       GTTX_Text, (ULONG)scanner_make_model, TAG_DONE);
                                 }
                                 operation_in_progress = FALSE;
                             }
@@ -2006,7 +2101,7 @@ static void process_window_events(struct Window *win) {
                                     mg = find_model_gadget(win);
                                     if (mg) {
                                         GT_SetGadgetAttrs(mg, win, NULL,
-                                                           GTST_String, (ULONG)scanner_make_model, TAG_DONE);
+                                                           GTTX_Text, (ULONG)scanner_make_model, TAG_DONE);
                                     }
                                 } else {
                                     printf("Enter a scanner IPv4 address first\n");
@@ -2080,6 +2175,14 @@ static void process_window_events(struct Window *win) {
                         }
                         case GAD_SAVEPATH_STRING:
                             sync_string_gadget(win, GAD_SAVEPATH_STRING, savepath_buffer, sizeof(savepath_buffer));
+                            break;
+                        case GAD_BROWSE_BUTTON:
+                            if (!operation_in_progress) {
+                                operation_in_progress = TRUE;
+                                sync_string_gadget(win, GAD_SAVEPATH_STRING, savepath_buffer, sizeof(savepath_buffer));
+                                do_browse_savepath(win);
+                                operation_in_progress = FALSE;
+                            }
                             break;
                         case GAD_SCAN_BUTTON:
                             if (!operation_in_progress) {
@@ -2172,8 +2275,14 @@ int main(void) {
         return 1;
     }
 
+    /* Optional - do_browse_savepath() just falls back to reporting it's
+       unavailable rather than the whole app refusing to start over a
+       "Browse" convenience button. */
+    AslBase = OpenLibrary((CONST_STRPTR)"asl.library", 37);
+
     font = OpenFont(&Topaz60);
     if (!font) {
+        if (AslBase) CloseLibrary(AslBase);
         CloseLibrary(SocketBase);
         CloseLibrary(GadToolsBase);
         CloseLibrary((struct Library *)GfxBase);
@@ -2184,6 +2293,7 @@ int main(void) {
     screen = LockPubScreen(NULL);
     if (!screen) {
         CloseFont(font);
+        if (AslBase) CloseLibrary(AslBase);
         CloseLibrary(SocketBase);
         CloseLibrary(GadToolsBase);
         CloseLibrary((struct Library *)GfxBase);
@@ -2195,6 +2305,7 @@ int main(void) {
     if (!vi) {
         UnlockPubScreen(NULL, screen);
         CloseFont(font);
+        if (AslBase) CloseLibrary(AslBase);
         CloseLibrary(SocketBase);
         CloseLibrary(GadToolsBase);
         CloseLibrary((struct Library *)GfxBase);
@@ -2213,6 +2324,7 @@ int main(void) {
         FreeVisualInfo(vi);
         UnlockPubScreen(NULL, screen);
         CloseFont(font);
+        if (AslBase) CloseLibrary(AslBase);
         CloseLibrary(SocketBase);
         CloseLibrary(GadToolsBase);
         CloseLibrary((struct Library *)GfxBase);
@@ -2226,8 +2338,8 @@ int main(void) {
         WA_AutoAdjust, TRUE,
         WA_Width, 480,
         WA_MinWidth, 480,
-        WA_InnerHeight, 380,
-        WA_MinHeight, 380,
+        WA_InnerHeight, 354,
+        WA_MinHeight, 354,
         WA_DragBar, TRUE,
         WA_DepthGadget, TRUE,
         WA_Activate, TRUE,
@@ -2244,6 +2356,7 @@ int main(void) {
         FreeVisualInfo(vi);
         UnlockPubScreen(NULL, screen);
         CloseFont(font);
+        if (AslBase) CloseLibrary(AslBase);
         CloseLibrary(SocketBase);
         CloseLibrary(GadToolsBase);
         CloseLibrary((struct Library *)GfxBase);
@@ -2256,6 +2369,12 @@ int main(void) {
 
     if (scanner_host[0]) {
         printf("Loaded saved scanner: %s\n", scanner_host);
+        /* Show current status on load too, not just after the next
+           Discover/Query click - the window and its Status gadget both
+           exist by this point, and this is exactly the bounded,
+           worst-case-16s call connect_with_timeout()/http_connect()
+           already make everywhere else, not an unbounded startup probe. */
+        query_scanner_status(scanner_host, scanner_port);
     } else {
         printf("Click Discover to find scanners on the LAN\n");
     }
@@ -2269,6 +2388,7 @@ int main(void) {
     if (screen) { UnlockPubScreen(NULL, screen); screen = NULL; }
     if (font) { CloseFont(font); font = NULL; }
 
+    if (AslBase) CloseLibrary(AslBase);
     CloseLibrary(SocketBase);
     CloseLibrary(GadToolsBase);
     CloseLibrary((struct Library *)GfxBase);

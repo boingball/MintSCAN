@@ -127,6 +127,37 @@ slot's saved model name, peeked straight off disk without disturbing the
 live GUI state, matching MintPRINT's `peek_unit_model()`/
 `refresh_unit_dropdown()` pair.
 
+## Unit vs. Scanner: two dropdowns, two different jobs
+
+These look redundant at a glance (both can end up showing the same
+scanner) but answer different questions. **Unit** is "which of my eight
+*saved* profiles am I looking at" - a config file on disk, picked with
+`reload_current_unit()`, independent of anything on the network right
+now. **Scanner** is "which of the scanners *just discovered* on the LAN
+(or manually IP'd/Queried) am I about to use" - an in-memory list from
+the last Discover click, picked with `select_discovered_scanner()`. The
+normal flow is Discover -> pick from Scanner -> Save Config, which
+writes the picked scanner into whichever Unit slot is current - collapsing
+them into one control would lose either "switch to a profile I saved
+weeks ago without touching the network" or "here's what's on the LAN
+right now, none of which I've saved yet". `load_unit_config()` seeds
+Scanner's list with a single "saved" entry so the two agree right after
+a Unit switch, before any live Discover has run.
+
+## Save-to file requester
+
+`do_browse_savepath()` opens a standard ASL file requester
+(`asl.library`, `AllocAslRequestTags(ASL_FileRequest, ...)`) instead of
+requiring `savepath_buffer` to be typed by hand. `FilePart()` splits the
+current path into a starting drawer/file for the requester's
+`ASLFR_InitialDrawer`/`ASLFR_InitialFile`, and a result is rebuilt with
+`AddPart()` rather than plain string concatenation, since `AddPart()`
+already knows whether the drawer ends in `/`/`:` and only inserts a
+separator when it doesn't. `asl.library` is opened once at startup but
+treated as optional - if it's missing, Browse just reports that instead
+of the app refusing to start over what's a convenience on top of typing
+a path, not a requirement.
+
 ## Wi-Fi scanners that sleep between jobs
 
 `http_connect()` bounds every connect attempt with `connect_with_timeout()`
