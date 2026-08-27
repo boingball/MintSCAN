@@ -13,7 +13,7 @@ that speaks eSCL directly and writes the result to a file.
 
 ```
 GET  /eSCL/ScannerCapabilities   -> capabilities XML (formats, resolutions, MakeAndModel)
-GET  /eSCL/ScannerStatus         -> idle/processing state (not yet used)
+GET  /eSCL/ScannerStatus         -> idle/processing state (query_scanner_status())
 POST /eSCL/ScanJobs              -> ScanSettings XML in, "Location" response header
                                      out (the new job's URL)
 GET  {Location}/NextDocument     -> the scanned page, as the requested
@@ -142,16 +142,39 @@ awake. A genuinely dead endpoint still fails fast via
 ECONNREFUSED/host-unreachable well inside the timeout, so the retry
 costs little.
 
-## Why every recv() goes through recv_timeout()
+## Why every recv() and send() goes through a *_timeout() wrapper
 
-The app is single-threaded, so a `recv()` that never returns freezes the
-whole GUI - confirmed by testing: after a successful scan, the best-effort
-`ScanJobs` `DELETE` cleanup would sit forever in a `while (recv(...) > 0)`
-drain loop against a scanner that never replied to `DELETE` and never
-closed the connection. `SO_RCVTIMEO` is set on every socket, but isn't
-trusted alone to bound `recv()` - same caution the mDNS code already
-applies to UDP sockets, just not every bsdsocket.library stack honours it
-reliably for TCP either. `recv_timeout()` wraps every `recv()` in this
-file with an explicit `WaitSelect`, and `http_delete()` no longer reads a
-response at all (fire-and-forget - the scanner will expire the job on its
-own if the `DELETE` doesn't land).
+The app is single-threaded, so a `recv()` or `send()` that never returns
+freezes the whole GUI - confirmed by testing: after a successful scan, the
+best-effort `ScanJobs` `DELETE` cleanup would sit forever in a
+`while (recv(...) > 0)` drain loop against a scanner that never replied to
+`DELETE` and never closed the connection. `SO_RCVTIMEO` is set on every
+socket, but isn't trusted alone to bound `recv()` - same caution the mDNS
+code already applies to UDP sockets, just not every bsdsocket.library
+stack honours it reliably for TCP either. `recv_timeout()` wraps every
+`recv()` in this file with an explicit `WaitSelect`, and `http_delete()`
+no longer reads a response at all (fire-and-forget - the scanner will
+expire the job on its own if the `DELETE` doesn't land).
+
+`send()` had the same gap for a while (MintPRINT's own `ipp_client.c`
+shipped with exactly this: `connect()`/`recv()` timeout-bounded, `send()`
+still a plain blocking call, fixed in its 1.2.5). A scanner that accepts a
+connection and then stops draining its TCP receive window mid-request -
+not just mid-response - blocks `send()` the same way a stalled `recv()`
+blocks the GUI. `send_timeout()` mirrors `recv_timeout()`
+(`WaitSelect`-bounded, looped for short writes) and is used everywhere
+`send()` used to be called directly.
+
+## Scanner status (ScannerStatus)
+
+`query_scanner_status()` reads `/eSCL/ScannerStatus` and records the
+top-level `pwg:State` (Idle/Processing/Testing/Stopped/Down) - not the
+per-job state further down the same document, which needs a job UUID to
+correlate and isn't tracked here. It runs after every successful
+`ScannerCapabilities` query and again if `ScanJobs` fails, so a bare HTTP
+status code ("ScanJobs failed (status 503)") gets a real reason
+alongside it when the scanner offers one ("... - scanner reports:
+Processing"). Shown live in the **Status:** field next to Model - the
+same idea as MintPRINT surfacing `printer-state` next to its ink/toner
+strip. Not fatal if the request fails or the element is missing;
+`ScannerStatus` support is optional in some firmware.

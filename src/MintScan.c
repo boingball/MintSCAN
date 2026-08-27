@@ -57,8 +57,9 @@ static const char USED min_stack[] = "$STACK:393216";
 #define GAD_IP_STRING        13
 #define GAD_QUERY_BUTTON     14
 #define GAD_UNIT_DROPDOWN    15
+#define GAD_STATUS_DISPLAY   16
 
-#define MINTSCAN_VERSION "1.0.0"
+#define MINTSCAN_VERSION "1.1.0"
 
 /* Saved scanner profiles: ENV(ARC):MintSCAN/Unit0 .. Unit(MAX_UNITS-1),
    switched via GAD_UNIT_DROPDOWN - same Unit0-7 idea as MintPRINT's
@@ -74,7 +75,7 @@ static const char USED min_stack[] = "$STACK:393216";
 #define MAX_BUFFER    65536   /* capabilities / ScanJobs response scratch */
 #define MAX_OUTPUT_LINES 8
 #define MAX_OUTPUT_LINE_LENGTH 55
-#define OUTPUT_TOP    265
+#define OUTPUT_TOP    285
 #define OUTPUT_LEFT   10
 #define OUTPUT_LINE_H 10
 #define OUTPUT_RIGHT  (window->Width - 20)
@@ -102,6 +103,13 @@ static char scanner_host[64] = "";
 static int  scanner_port = 80;
 static char scanner_make_model[96] = "";
 static BOOL have_capabilities = FALSE;
+
+/* Last-queried /eSCL/ScannerStatus pwg:State (Idle/Processing/Testing/
+   Stopped/Down) - see query_scanner_status(). Shown live next to Model,
+   the same idea as MintPRINT showing printer-state next to its ink/toner
+   strip, and used to turn a bare ScanJobs failure status code into an
+   actual reason ("scanner reports: Processing" instead of "status 503"). */
+static char scanner_status_text[32] = "";
 
 /* Raw ScannerCapabilities body from the last successful query, kept
    around so resolve_dpi()/resolve_color_value() can re-scope their
@@ -203,6 +211,7 @@ static void custom_printf(const char *format, ...);
 static struct Gadget *find_gadget_by_id(struct Window *win, int id);
 static struct Gadget *find_model_gadget(struct Window *win);
 static void rebuild_scanner_dropdown(void);
+static void refresh_status_gadget(void);
 
 /* --------------------------------------------------------------------
  * Status output box
@@ -590,6 +599,7 @@ static void apply_unit_to_gadgets(struct Window *win) {
     if ((g = find_model_gadget(win))) {
         GT_SetGadgetAttrs(g, win, NULL, GTST_String, (ULONG)scanner_make_model, TAG_DONE);
     }
+    refresh_status_gadget();
     if ((g = find_gadget_by_id(win, GAD_SOURCE_DROPDOWN))) {
         GT_SetGadgetAttrs(g, win, NULL, GTCY_Active, (ULONG)source_index, TAG_DONE);
     }
@@ -615,6 +625,7 @@ static void apply_unit_to_gadgets(struct Window *win) {
 static void reload_current_unit(struct Window *win) {
     have_capabilities = FALSE;
     capabilities_xml[0] = '\0';
+    scanner_status_text[0] = '\0';
 
     if (load_unit_config(current_unit_index)) {
         printf("Loaded Unit%d\n", current_unit_index);
@@ -1101,6 +1112,40 @@ static ssize_t recv_timeout(int sockfd, char *buf, int len, int timeout_secs) {
     return recv(sockfd, buf, len, 0);
 }
 
+/* send()'s write-side counterpart to recv_timeout() - MintPRINT's own
+   ipp_client had exactly this gap once: connect() and recv() bounded,
+   send() still a plain blocking call. A scanner that accepts a
+   connection and then stops draining its TCP receive window mid-request
+   (not just mid-response) would block send() forever, freezing this
+   single-threaded GUI the same way an unbounded recv() did. Loops
+   because a large write (the ScanSettings XML body) can legitimately
+   return a short count rather than sending it all in one call. Returns
+   the total bytes sent, or -1 on timeout/error (matching recv_timeout's
+   convention) - never a partial-success count. */
+static ssize_t send_timeout(int sockfd, const char *buf, int len, int timeout_secs) {
+    int total = 0;
+
+    while (total < len) {
+        fd_set writefds;
+        struct timeval tv;
+        long ready;
+        ssize_t sent;
+
+        drain_gui_events();
+        FD_ZERO(&writefds);
+        FD_SET(sockfd, &writefds);
+        tv.tv_sec = timeout_secs;
+        tv.tv_usec = 0;
+        ready = WaitSelect(sockfd + 1, NULL, &writefds, NULL, &tv, NULL);
+        if (ready <= 0) return -1;
+
+        sent = send(sockfd, (char *)(buf + total), len - total, 0);
+        if (sent <= 0) return -1;
+        total += (int)sent;
+    }
+    return total;
+}
+
 /* GET request. On success returns the HTTP status code and leaves the
    response body (headers stripped) in response[]. */
 static int http_get(const char *ip, int port, const char *path,
@@ -1120,7 +1165,7 @@ static int http_get(const char *ip, int port, const char *path,
     snprintf(header, sizeof(header),
              "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, ip);
 
-    if (send(sockfd, header, strlen(header), 0) < 0) {
+    if (send_timeout(sockfd, header, (int)strlen(header), 8) < 0) {
         CloseSocket(sockfd);
         return -1;
     }
@@ -1170,8 +1215,8 @@ static int http_post_xml(const char *ip, int port, const char *path,
              "Content-Length: %d\r\nConnection: close\r\n\r\n",
              path, ip, (int)strlen(body_in));
 
-    if (send(sockfd, header, strlen(header), 0) < 0 ||
-        send(sockfd, (char *)body_in, strlen(body_in), 0) < 0) {
+    if (send_timeout(sockfd, header, (int)strlen(header), 8) < 0 ||
+        send_timeout(sockfd, body_in, (int)strlen(body_in), 8) < 0) {
         CloseSocket(sockfd);
         return -1;
     }
@@ -1227,7 +1272,7 @@ static void http_delete(const char *ip, int port, const char *path) {
        on its own if this doesn't land. */
     snprintf(header, sizeof(header),
              "DELETE %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, ip);
-    send(sockfd, header, strlen(header), 0);
+    send_timeout(sockfd, header, (int)strlen(header), 8);
     CloseSocket(sockfd);
 }
 
@@ -1365,7 +1410,7 @@ static BOOL download_next_document(const char *ip, int port, const char *job_pat
     snprintf(header, sizeof(header),
              "GET %s/NextDocument HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
              job_path, ip);
-    if (send(sockfd, header, strlen(header), 0) < 0) {
+    if (send_timeout(sockfd, header, (int)strlen(header), 8) < 0) {
         CloseSocket(sockfd);
         return FALSE;
     }
@@ -1474,6 +1519,46 @@ static BOOL download_next_document(const char *ip, int port, const char *job_pat
  * eSCL protocol calls
  * ----------------------------------------------------------------- */
 
+/* Pushes scanner_status_text into the live Status gadget, if the window
+   is open yet. find_gadget_by_id() ignores its win argument (it always
+   walks the global glist), so this is safe to call from do_scan(), which
+   has no window parameter of its own - it uses the global window. */
+static void refresh_status_gadget(void) {
+    struct Gadget *g = find_gadget_by_id(window, GAD_STATUS_DISPLAY);
+    if (g) {
+        GT_SetGadgetAttrs(g, window, NULL, GTST_String, (ULONG)scanner_status_text, TAG_DONE);
+    }
+}
+
+/* GET /eSCL/ScannerStatus and record just the top-level device state
+   (eSCL's pwg:State: Idle/Processing/Testing/Stopped/Down) - not the
+   per-job state further down the same document, which needs a job UUID
+   to correlate and isn't tracked here. Not fatal if this fails or the
+   element isn't present - ScannerStatus support is optional in some
+   firmware and its absence shouldn't block scanning. */
+static void query_scanner_status(const char *ip, int port) {
+    char response[2048];
+    int status;
+    char *tag, *end;
+
+    scanner_status_text[0] = '\0';
+    status = http_get(ip, port, "/eSCL/ScannerStatus", response, sizeof(response));
+    if (status == 200) {
+        tag = strstr(response, "<pwg:State>");
+        if (tag) {
+            tag += 11;
+            end = strstr(tag, "</");
+            if (end) {
+                int len = (int)(end - tag);
+                if (len >= (int)sizeof(scanner_status_text)) len = sizeof(scanner_status_text) - 1;
+                memcpy(scanner_status_text, tag, len);
+                scanner_status_text[len] = '\0';
+            }
+        }
+    }
+    refresh_status_gadget();
+}
+
 static void query_capabilities(const char *ip, int port) {
     int status;
     char *tag, *end;
@@ -1505,6 +1590,11 @@ static void query_capabilities(const char *ip, int port) {
         printf("Found: %s\n", scanner_make_model);
     } else {
         printf("Capabilities OK (model name not found in response)\n");
+    }
+
+    query_scanner_status(ip, port);
+    if (scanner_status_text[0]) {
+        printf("Scanner status: %s\n", scanner_status_text);
     }
 }
 
@@ -1592,7 +1682,12 @@ static void do_scan(void) {
     status = http_post_xml(scanner_host, scanner_port, "/eSCL/ScanJobs", xml,
                             location, sizeof(location));
     if (status != 201 || !location[0]) {
-        printf("ScanJobs failed (status %d)\n", status);
+        query_scanner_status(scanner_host, scanner_port);
+        if (scanner_status_text[0]) {
+            printf("ScanJobs failed (status %d) - scanner reports: %s\n", status, scanner_status_text);
+        } else {
+            printf("ScanJobs failed (status %d)\n", status);
+        }
         return;
     }
 
@@ -1692,7 +1787,12 @@ static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWOR
     ng.ng_TopEdge += 20;
     ng.ng_Width = 250;
     ng.ng_Height = 14;
-    ng.ng_GadgetText = (STRPTR)"_IP:";
+    /* Not "IP" alone: parse_host_port()'s result only ever reaches
+       inet_addr() (see http_connect_once()), so a hostname is never
+       actually resolved - same accurate-labeling fix MintPRINT applied
+       to its own "Printer IP/Host" field once it realised the same
+       thing about its own inet_addr()-only IP field. */
+    ng.ng_GadgetText = (STRPTR)"_IPv4:";
     ng.ng_GadgetID = GAD_IP_STRING;
     gad = CreateGadget(STRING_KIND, gad, &ng,
         GTST_String, (ULONG)ip_entry_buffer,
@@ -1721,6 +1821,22 @@ static struct Gadget *createAllGadgets(struct Gadget **glistptr, void *ivi, UWOR
     gad = CreateGadget(STRING_KIND, gad, &ng,
         GTST_String, (ULONG)scanner_make_model,
         GTST_MaxChars, sizeof(scanner_make_model) - 1,
+        GA_Disabled, TRUE,
+        TAG_DONE);
+    if (!gad) return NULL;
+
+    /* Live /eSCL/ScannerStatus device state (Idle/Processing/.../Down) -
+       same disabled-string-display idiom as Model above, refreshed by
+       refresh_status_gadget() whenever query_scanner_status() runs. */
+    ng.ng_LeftEdge = 100;
+    ng.ng_TopEdge += 20;
+    ng.ng_Width = 200;
+    ng.ng_Height = 14;
+    ng.ng_GadgetText = (STRPTR)"Status:";
+    ng.ng_GadgetID = GAD_STATUS_DISPLAY;
+    gad = CreateGadget(STRING_KIND, gad, &ng,
+        GTST_String, (ULONG)scanner_status_text,
+        GTST_MaxChars, sizeof(scanner_status_text) - 1,
         GA_Disabled, TRUE,
         TAG_DONE);
     if (!gad) return NULL;
@@ -1893,7 +2009,7 @@ static void process_window_events(struct Window *win) {
                                                            GTST_String, (ULONG)scanner_make_model, TAG_DONE);
                                     }
                                 } else {
-                                    printf("Enter a scanner IP first\n");
+                                    printf("Enter a scanner IPv4 address first\n");
                                 }
                                 operation_in_progress = FALSE;
                             }
@@ -2110,8 +2226,8 @@ int main(void) {
         WA_AutoAdjust, TRUE,
         WA_Width, 480,
         WA_MinWidth, 480,
-        WA_InnerHeight, 360,
-        WA_MinHeight, 360,
+        WA_InnerHeight, 380,
+        WA_MinHeight, 380,
         WA_DragBar, TRUE,
         WA_DepthGadget, TRUE,
         WA_Activate, TRUE,

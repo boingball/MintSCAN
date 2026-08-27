@@ -36,6 +36,36 @@ AmigaOS "device" concept to hook into the way printing has
 `DEVS:Printers/`, so there is no driver component here - just one GUI
 program.
 
+## What's new in 1.1.0
+
+MintSCAN 1.1.0 closes the one remaining gap from the MintPRINT-learnings
+review: `send()` had no timeout even though `connect()`/`recv()` already
+did, plus a real eSCL capability (`ScannerStatus`) that wasn't used yet,
+plus a GUI pass to match MintPRINT's conventions more closely.
+
+- **No more indefinite hangs on a scanner that stops draining its TCP
+  receive window mid-request.** `connect()` and `recv()` were already
+  timeout-bounded, but every `send()` call (headers, the ScanSettings XML
+  body, `DELETE` cleanup, `NextDocument`'s request) was still a plain
+  blocking call - the same gap MintPRINT's `ipp_client.c` had before its
+  1.2.5 fix. `send_timeout()` (`src/MintScan.c`) mirrors the existing
+  `recv_timeout()` - `WaitSelect()`-bounded, looped for short writes -
+  and is now used everywhere `send()` was.
+- **Live scanner status.** `/eSCL/ScannerStatus` was discovered but never
+  queried. `query_scanner_status()` now reads its `pwg:State`
+  (Idle/Processing/Testing/Stopped/Down) after every successful
+  capabilities query and shows it in a new **Status:** field next to
+  Model - the same idea as MintPRINT showing live `printer-state` next to
+  its ink/toner strip. A failed `ScanJobs` also queries it, so "status
+  503" becomes "ScanJobs failed (status 503) - scanner reports:
+  Processing" instead of a bare code.
+- **"IPv4:" instead of "IP:".** The manual-entry field only ever reaches
+  `inet_addr()` (see `http_connect_once()`), so a hostname was never
+  actually supported - same accurate-labeling fix MintPRINT applied to
+  its own IP field once it noticed the same thing.
+- Window grew by 20px to fit the new Status row; everything below it
+  shifted down to match.
+
 ## What's new in 1.0.0
 
 - **Saved scanner profiles, Unit0-7.** Same idea as MintPRINT's printer
