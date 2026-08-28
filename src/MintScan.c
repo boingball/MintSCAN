@@ -1631,22 +1631,17 @@ static void build_scan_settings_xml(char *buf, int buf_size) {
     BOOL use_document_format_ext = source_uses_document_format_ext();
     char format_ext[128];
 
-    /* BlackAndWhite1 (1-bit) renders as narrow, diagonally-sheared
-       garbage on real hardware - both JPEG and PNG. Not the scanner's
-       fault: windows_escl_probe.py sending this exact same request and
-       saving the exact same bytes gets back a JPEG Python's PIL opens
-       and decodes cleanly, no errors. What's different about a
-       BlackAndWhite1 response is almost certainly its encoding, not its
-       correctness - a scanner asked for 1-bit output commonly emits a
-       genuine monochrome JPEG (1 component, no YCbCr) or a real
-       1-bit-depth PNG (colour-type 0) instead of the everyday 8-bit/
-       3-component case, and older or minimal picture datatypes are
-       known to mishandle exactly those two variants while a modern
-       decoder shrugs them off. MintSCAN never decodes the image itself
-       (NextDocument's bytes go straight to a file) so there's nothing
-       to fix in the download path either way - substitute Grayscale8,
-       which always uses the ordinary 8-bit encoding both formats and
-       every viewer handle without incident. See docs/ARCHITECTURE.md. */
+    /* BlackAndWhite1 (1-bit) is broken on real hardware - confirmed
+       scanner-side, not an Amiga/MintSCAN problem: windows_escl_probe.py
+       sending this exact request from a plain PC (no Amiga involved at
+       all) got back a JPEG that opens fine but is full RGB colour with
+       visible horizontal banding, despite explicitly requesting
+       BlackAndWhite1 - the scanner is just not honouring the requested
+       ColorMode for this value. MintSCAN never decodes the image itself
+       (NextDocument's bytes go straight to a file), so there was never
+       anything to fix in the download path - substitute Grayscale8,
+       which the same scanner does honour correctly. See
+       docs/ARCHITECTURE.md for the probe output this is based on. */
     if (strcmp(color_value, "BlackAndWhite1") == 0) {
         printf("Black & White doesn't display correctly here - using Grayscale instead\n");
         color_value = "Grayscale8";

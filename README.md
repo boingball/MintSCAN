@@ -45,22 +45,18 @@ program.
   `char *` - GCC won't subtract pointers to different base types even
   though both are single-byte) - caught on a real `m68k-amigaos-gcc`
   build.
-- **Black & White no longer produces a badly squashed, garbled scan.**
-  Diagnosed through two wrong guesses first (a JPEG container limit,
-  then a suspected scanner firmware bug) before `windows_escl_probe.py
-  <ip> --color BlackAndWhite1` settled it: the exact same request,
-  fetched with a PC, comes back as a JPEG that opens and decodes
-  perfectly under Python - the scanner's bytes are fine. The real cause
-  is almost certainly the Amiga picture datatype being used to view the
-  result: a scanner asked for 1-bit output commonly emits a genuine
-  monochrome JPEG or a real 1-bit-depth PNG instead of the everyday
-  8-bit case, and that's exactly the kind of thing a full decoder
-  shrugs off and a simpler one mishandles into visible shearing.
-  `build_scan_settings_xml()` now substitutes Grayscale for
-  `BlackAndWhite1` across every format and says so - Grayscale always
-  uses the ordinary encoding every viewer already handles. See
-  `docs/ARCHITECTURE.md` for the full trail if a future Amiga JPEG/PNG
-  datatype ever makes it worth revisiting.
+- **Black & White no longer produces a badly squashed, garbled scan -
+  confirmed scanner-side, not an Amiga or MintSCAN problem.** Two wrong
+  guesses along the way (a JPEG container limit, then an Amiga
+  picture-datatype limitation) before actually looking at what
+  `windows_escl_probe.py <ip> --color BlackAndWhite1` saved settled it:
+  full RGB colour, with visible horizontal banding, despite explicitly
+  requesting `BlackAndWhite1` - fetched by a plain PC script with no
+  Amiga anywhere in the path. The scanner just isn't honouring that
+  `ColorMode` value. `build_scan_settings_xml()` now substitutes
+  Grayscale for `BlackAndWhite1` across every format and says so - the
+  same scanner does honour Grayscale8 correctly. See
+  `docs/ARCHITECTURE.md` for the full trail.
 
 ## What's new in 1.2.0
 

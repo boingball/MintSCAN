@@ -111,30 +111,26 @@ entirely and go straight to `ScannerCapabilities`.
   out to support it, not because it's queried - a flatbed too small for
   A3 would just get a `ScanRegions` request bigger than its bed.
 - **Black & White (`BlackAndWhite1`) is forced to Grayscale for every
-  format - very likely an Amiga picture-datatype limitation, not
-  anything wrong with the scanner or with MintSCAN itself.** First
-  diagnosed (wrongly) as a JPEG container problem, then as a scanner
-  firmware defect once a follow-up report showed the identical narrow,
-  diagonally-sheared corruption in PNG too. `windows_escl_probe.py
-  <ip> --color BlackAndWhite1` (its default) settled it: run against
-  real hardware with the exact same `ScanSettings` request
-  `build_scan_settings_xml()` builds, the JPEG it saved opened and
-  decoded cleanly under Python's PIL, no errors - the scanner's bytes
-  are correct. What a scanner asked for 1-bit output commonly does
-  differently is the *encoding*, not the correctness: a genuine
-  monochrome JPEG (1 component, no YCbCr) or a real 1-bit-depth PNG
-  (colour-type 0) instead of the everyday 8-bit/3-component case older
-  or minimal picture datatypes are built to expect - exactly the kind
-  of thing a full decoder like PIL handles without noticing and a
-  simpler one mishandles into visible shearing. MintSCAN never decodes
-  the image itself - `NextDocument`'s bytes go straight to a file - so
-  there was never anything to fix in the HTTP/download path either.
+  format - confirmed scanner-side, not an Amiga or MintSCAN problem.**
+  Two wrong guesses along the way: first a JPEG container limit (JPEG
+  can't encode 1-bit data - disproven when PNG, which can, showed the
+  identical corruption), then an Amiga picture-datatype limitation
+  (based on `windows_escl_probe.py <ip> --color BlackAndWhite1`'s saved
+  JPEG opening without error under Python's PIL - which turned out to
+  prove only that the *container* was well-formed, not that the *image*
+  was correct). Actually looking at that saved file settled it for real:
+  full RGB colour - skin tones, a red apple, visible horizontal banding
+  - despite the request explicitly asking for `BlackAndWhite1`, fetched
+  by a plain PC script with no Amiga anywhere in the path. The scanner
+  simply isn't honouring `BlackAndWhite1` as a `ColorMode` value, full
+  stop - nothing to fix in MintSCAN's request or its (nonexistent, it
+  never decodes the image) processing of the response.
   `build_scan_settings_xml()` substitutes Grayscale8 whenever
   BlackAndWhite1 is selected and logs it, the same way an unsupported
-  DPI/Colour value gets substituted and logged elsewhere - Grayscale
-  always uses the ordinary encoding every viewer already handles. Worth
-  revisiting if a different/updated Amiga JPEG or PNG datatype turns
-  out to handle the monochrome/1-bit variants correctly.
+  DPI/Colour value gets substituted and logged elsewhere - the same
+  scanner does honour Grayscale8 correctly. Worth revisiting only
+  against a firmware update, or a different scanner, that's confirmed to
+  actually produce a clean `BlackAndWhite1` image.
 
 ## Saved profiles: Unit0-7
 
