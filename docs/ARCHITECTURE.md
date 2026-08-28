@@ -110,16 +110,27 @@ entirely and go straight to `ScannerCapabilities`.
   `MaxWidth`/`MaxHeight`.** A3 was added because a real scanner turned
   out to support it, not because it's queried - a flatbed too small for
   A3 would just get a `ScanRegions` request bigger than its bed.
-- **Black & White (`BlackAndWhite1`) is forced to Grayscale when Format
-  is JPEG.** JPEG has no 1-bit-per-pixel encoding at all (8 bits is its
-  minimum sample depth), and asking a scanner for that combination
-  anyway isn't guaranteed to fail cleanly - a real report came back as a
-  JPEG roughly 1/8th the expected width, consistent with 1-bit packed
-  bytes (8 real pixels each) being written straight through as 8-bit
-  samples rather than unpacked first. `build_scan_settings_xml()`
-  substitutes Grayscale8 for JPEG specifically and logs it, the same way
-  an unsupported DPI/Colour value gets substituted and logged elsewhere.
-  PNG and PDF aren't affected - both can hold a real 1-bit image.
+- **Black & White (`BlackAndWhite1`) is forced to Grayscale for every
+  format, at least until a scanner is confirmed to actually produce a
+  clean one.** First diagnosed as a JPEG-only problem (JPEG has no
+  1-bit-per-pixel encoding at all - 8 bits is its minimum sample depth -
+  and a real report came back as a JPEG roughly 1/8th the expected
+  width), but a follow-up report showed the identical narrow,
+  diagonally-sheared corruption in PNG too, which PNG's real 1-bit
+  support rules out as a container-format limitation. Two structurally
+  unrelated encoders (JPEG, PNG) breaking the same way points at the
+  scanner's own 1-bit raster capture/packing, upstream of whichever
+  format wraps it - not something the request side can fix.
+  `build_scan_settings_xml()` substitutes Grayscale8 whenever
+  BlackAndWhite1 is selected and logs it, the same way an unsupported
+  DPI/Colour value gets substituted and logged elsewhere. To narrow this
+  down further: run `windows_escl_probe.py <ip> --color BlackAndWhite1`
+  (its default) from a PC on the same network - it builds the identical
+  ScanSettings request MintScan.c would and saves the raw response, so a
+  still-corrupted `scan_probe_output.*` from a PC would confirm the
+  scanner itself is at fault rather than anything in MintSCAN's own
+  HTTP/download path, and a *clean* one from the same request would mean
+  the opposite - worth reopening this if that ever comes back clean.
 
 ## Saved profiles: Unit0-7
 

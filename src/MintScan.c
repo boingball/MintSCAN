@@ -1631,20 +1631,20 @@ static void build_scan_settings_xml(char *buf, int buf_size) {
     BOOL use_document_format_ext = source_uses_document_format_ext();
     char format_ext[128];
 
-    /* JPEG has no way to represent 1-bit-per-pixel data (8 bits is its
-       minimum sample depth per component). A scanner asked for
-       BlackAndWhite1 + JPEG together may not reject the job outright
-       rather than fail cleanly - a real-hardware report against this
-       combination came back as a JPEG roughly 1/8th the expected width,
-       consistent with the packed 1-bit bytes (8 real pixels per byte)
-       being written straight through as if each byte were one 8-bit
-       greyscale sample, instead of being unpacked first. Force
-       Grayscale8 for this one format - the narrowest encoding JPEG
-       actually supports - since there's no valid combination to fall
-       back to otherwise. PNG and PDF (see the Format dropdown) can both
-       hold a real 1-bit image if Black & White specifically matters. */
-    if (strcmp(color_value, "BlackAndWhite1") == 0 && strcmp(mime, "image/jpeg") == 0) {
-        printf("Black & White isn't valid in JPEG (min. 8-bit) - using Grayscale instead\n");
+    /* BlackAndWhite1 (1-bit) comes back corrupted on at least one real
+       scanner - not a JPEG-only problem: a real-hardware report showed
+       the same narrow, diagonally-sheared garbage in PNG output too,
+       which rules out "JPEG can't encode 1-bit" as the cause (PNG
+       genuinely can). Two structurally unrelated encoders breaking
+       identically points at the scanner's own 1-bit raster capture/
+       packing, upstream of whichever format wraps it - not something
+       fixable from the request side. Substitute Grayscale8 across every
+       format until a scanner is confirmed to actually produce a clean
+       BlackAndWhite1 image; a real 1-bit encode is smaller/starker than
+       Grayscale, but wrong output isn't a usable tradeoff for that. See
+       docs/ARCHITECTURE.md for how to help narrow this down further. */
+    if (strcmp(color_value, "BlackAndWhite1") == 0) {
+        printf("Black & White scans corrupted on this hardware - using Grayscale instead\n");
         color_value = "Grayscale8";
     }
 
