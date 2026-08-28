@@ -46,19 +46,21 @@ program.
   though both are single-byte) - caught on a real `m68k-amigaos-gcc`
   build.
 - **Black & White no longer produces a badly squashed, garbled scan.**
-  First diagnosed as a JPEG-only issue (JPEG can't represent 1-bit data
-  at all - 8 bits is its minimum sample depth), but a follow-up report
-  showed the identical narrow, diagonally-sheared corruption in PNG too
-  - which PNG's real 1-bit support rules out as a format limitation.
-  Two unrelated encoders breaking the same way points at the scanner's
-  own 1-bit capture/packing, not anything fixable from the request side,
-  so `build_scan_settings_xml()` now substitutes Grayscale for
-  `BlackAndWhite1` across every format and says so - same "if the
-  scanner still ignores this, the request is what to check next"
-  logging style already used for unsupported DPI/Colour values. See
-  `docs/ARCHITECTURE.md` for how to help confirm this with
-  `windows_escl_probe.py` if you'd rather chase getting real 1-bit
-  output working again.
+  Diagnosed through two wrong guesses first (a JPEG container limit,
+  then a suspected scanner firmware bug) before `windows_escl_probe.py
+  <ip> --color BlackAndWhite1` settled it: the exact same request,
+  fetched with a PC, comes back as a JPEG that opens and decodes
+  perfectly under Python - the scanner's bytes are fine. The real cause
+  is almost certainly the Amiga picture datatype being used to view the
+  result: a scanner asked for 1-bit output commonly emits a genuine
+  monochrome JPEG or a real 1-bit-depth PNG instead of the everyday
+  8-bit case, and that's exactly the kind of thing a full decoder
+  shrugs off and a simpler one mishandles into visible shearing.
+  `build_scan_settings_xml()` now substitutes Grayscale for
+  `BlackAndWhite1` across every format and says so - Grayscale always
+  uses the ordinary encoding every viewer already handles. See
+  `docs/ARCHITECTURE.md` for the full trail if a future Amiga JPEG/PNG
+  datatype ever makes it worth revisiting.
 
 ## What's new in 1.2.0
 

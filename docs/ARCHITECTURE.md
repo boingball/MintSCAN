@@ -111,26 +111,30 @@ entirely and go straight to `ScannerCapabilities`.
   out to support it, not because it's queried - a flatbed too small for
   A3 would just get a `ScanRegions` request bigger than its bed.
 - **Black & White (`BlackAndWhite1`) is forced to Grayscale for every
-  format, at least until a scanner is confirmed to actually produce a
-  clean one.** First diagnosed as a JPEG-only problem (JPEG has no
-  1-bit-per-pixel encoding at all - 8 bits is its minimum sample depth -
-  and a real report came back as a JPEG roughly 1/8th the expected
-  width), but a follow-up report showed the identical narrow,
-  diagonally-sheared corruption in PNG too, which PNG's real 1-bit
-  support rules out as a container-format limitation. Two structurally
-  unrelated encoders (JPEG, PNG) breaking the same way points at the
-  scanner's own 1-bit raster capture/packing, upstream of whichever
-  format wraps it - not something the request side can fix.
+  format - very likely an Amiga picture-datatype limitation, not
+  anything wrong with the scanner or with MintSCAN itself.** First
+  diagnosed (wrongly) as a JPEG container problem, then as a scanner
+  firmware defect once a follow-up report showed the identical narrow,
+  diagonally-sheared corruption in PNG too. `windows_escl_probe.py
+  <ip> --color BlackAndWhite1` (its default) settled it: run against
+  real hardware with the exact same `ScanSettings` request
+  `build_scan_settings_xml()` builds, the JPEG it saved opened and
+  decoded cleanly under Python's PIL, no errors - the scanner's bytes
+  are correct. What a scanner asked for 1-bit output commonly does
+  differently is the *encoding*, not the correctness: a genuine
+  monochrome JPEG (1 component, no YCbCr) or a real 1-bit-depth PNG
+  (colour-type 0) instead of the everyday 8-bit/3-component case older
+  or minimal picture datatypes are built to expect - exactly the kind
+  of thing a full decoder like PIL handles without noticing and a
+  simpler one mishandles into visible shearing. MintSCAN never decodes
+  the image itself - `NextDocument`'s bytes go straight to a file - so
+  there was never anything to fix in the HTTP/download path either.
   `build_scan_settings_xml()` substitutes Grayscale8 whenever
   BlackAndWhite1 is selected and logs it, the same way an unsupported
-  DPI/Colour value gets substituted and logged elsewhere. To narrow this
-  down further: run `windows_escl_probe.py <ip> --color BlackAndWhite1`
-  (its default) from a PC on the same network - it builds the identical
-  ScanSettings request MintScan.c would and saves the raw response, so a
-  still-corrupted `scan_probe_output.*` from a PC would confirm the
-  scanner itself is at fault rather than anything in MintSCAN's own
-  HTTP/download path, and a *clean* one from the same request would mean
-  the opposite - worth reopening this if that ever comes back clean.
+  DPI/Colour value gets substituted and logged elsewhere - Grayscale
+  always uses the ordinary encoding every viewer already handles. Worth
+  revisiting if a different/updated Amiga JPEG or PNG datatype turns
+  out to handle the monochrome/1-bit variants correctly.
 
 ## Saved profiles: Unit0-7
 

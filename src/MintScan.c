@@ -1631,20 +1631,24 @@ static void build_scan_settings_xml(char *buf, int buf_size) {
     BOOL use_document_format_ext = source_uses_document_format_ext();
     char format_ext[128];
 
-    /* BlackAndWhite1 (1-bit) comes back corrupted on at least one real
-       scanner - not a JPEG-only problem: a real-hardware report showed
-       the same narrow, diagonally-sheared garbage in PNG output too,
-       which rules out "JPEG can't encode 1-bit" as the cause (PNG
-       genuinely can). Two structurally unrelated encoders breaking
-       identically points at the scanner's own 1-bit raster capture/
-       packing, upstream of whichever format wraps it - not something
-       fixable from the request side. Substitute Grayscale8 across every
-       format until a scanner is confirmed to actually produce a clean
-       BlackAndWhite1 image; a real 1-bit encode is smaller/starker than
-       Grayscale, but wrong output isn't a usable tradeoff for that. See
-       docs/ARCHITECTURE.md for how to help narrow this down further. */
+    /* BlackAndWhite1 (1-bit) renders as narrow, diagonally-sheared
+       garbage on real hardware - both JPEG and PNG. Not the scanner's
+       fault: windows_escl_probe.py sending this exact same request and
+       saving the exact same bytes gets back a JPEG Python's PIL opens
+       and decodes cleanly, no errors. What's different about a
+       BlackAndWhite1 response is almost certainly its encoding, not its
+       correctness - a scanner asked for 1-bit output commonly emits a
+       genuine monochrome JPEG (1 component, no YCbCr) or a real
+       1-bit-depth PNG (colour-type 0) instead of the everyday 8-bit/
+       3-component case, and older or minimal picture datatypes are
+       known to mishandle exactly those two variants while a modern
+       decoder shrugs them off. MintSCAN never decodes the image itself
+       (NextDocument's bytes go straight to a file) so there's nothing
+       to fix in the download path either way - substitute Grayscale8,
+       which always uses the ordinary 8-bit encoding both formats and
+       every viewer handle without incident. See docs/ARCHITECTURE.md. */
     if (strcmp(color_value, "BlackAndWhite1") == 0) {
-        printf("Black & White scans corrupted on this hardware - using Grayscale instead\n");
+        printf("Black & White doesn't display correctly here - using Grayscale instead\n");
         color_value = "Grayscale8";
     }
 
