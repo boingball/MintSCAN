@@ -1,0 +1,59 @@
+; MintSCAN 1.1.0 Installer script
+; $VER: Install-MintSCAN 1.1.0 (02.09.2026)
+;
+; MintSCAN is a standalone application. No driver, device, library or system
+; file is installed, and no reboot is required.
+
+(set #ms-appname "MintSCAN")
+
+(message
+    "MintSCAN 1.1.0 setup\n\n"
+    "MintSCAN scans directly from eSCL/AirScan network scanners to files "
+    "on a classic Amiga. This installer only copies the application drawer; "
+    "it does not change DEVS:, LIBS: or any system preferences."
+)
+
+(set #dest
+    (askdir
+        (prompt "Where should the MintSCAN drawer be installed?")
+        (help "Pick any drawer you like. SYS:Utilities is a sensible default.")
+        (default "SYS:Utilities")
+        (newpath)
+    )
+)
+
+(set #appdir (tackon #dest #ms-appname))
+(makedir #appdir)
+
+(copyfiles
+    (source (tackon #ms-appname "MintScan"))
+    (dest #appdir)
+    (infos)
+)
+
+(copyfiles
+    (source (tackon #ms-appname "MintSCAN.guide"))
+    (dest #appdir)
+)
+
+(copyfiles
+    (source (tackon #ms-appname "LICENSE"))
+    (dest #appdir)
+)
+
+(if (exists "MintSCAN.info")
+    (copyfiles
+        (source "MintSCAN.info")
+        (dest #dest)
+    )
+)
+
+(message
+    "MintSCAN installed to " #appdir ".\n\n"
+    "Run MintScan, then click Discover. If multicast discovery cannot "
+    "cross your network or emulator setup, enter the scanner IPv4 address "
+    "and click Query instead.\n\n"
+    "No reboot is required."
+)
+
+(exit)

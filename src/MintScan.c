@@ -30,15 +30,16 @@ typedef long ssize_t;
 #include <sys/ioctl.h> /* FIONBIO - connect_with_timeout() */
 #include <errno.h>     /* EINPROGRESS/EWOULDBLOCK - connect_with_timeout() */
 
+#include "http_response.h"
+#include "mdns_endpoint.h"
+
 #define USED __attribute__((used))
 
 /* Classic AmigaOS / libnix stack request - same convention as MintPRINT.
    The "$STACK:" cookie is honoured by newer startup code; classic m68k
-   GCC/libnix runtimes read the __stack variable instead. Keep this
-   comfortably large: GadTools + bsdsocket + the eSCL/chunk-decoder call
-   chains go several frames deep. 384 KiB = 393216 bytes. */
-unsigned long __stack = 393216UL;
-static const char USED min_stack[] = "$STACK:393216";
+   GCC/libnix runtimes read the __stack variable instead. */
+unsigned long __stack = 131072UL;
+static const char USED min_stack[] = "$STACK:131072";
 
 /* --------------------------------------------------------------------
  * Constants, gadget IDs, globals
@@ -62,7 +63,8 @@ static const char USED min_stack[] = "$STACK:393216";
 #define GAD_STATUS_DISPLAY   16
 #define GAD_BROWSE_BUTTON    17
 
-#define MINTSCAN_VERSION "1.2.1"
+#define MINTSCAN_VERSION "1.1.0"
+static const char USED version_tag[] = "$VER: MintScan 1.1.0 (02.09.2026)";
 
 /* Saved scanner profiles: ENV(ARC):MintSCAN/Unit0 .. Unit(MAX_UNITS-1),
    switched via GAD_UNIT_DROPDOWN - same Unit0-7 idea as MintPRINT's
@@ -86,6 +88,8 @@ static const char USED min_stack[] = "$STACK:393216";
 struct DiscoveredScanner {
     char ip[16];
     char label[80];
+    char root[128];
+    int port;
 };
 
 static struct DiscoveredScanner discovered[MAX_DISCOVERY_RESULTS];
@@ -104,6 +108,7 @@ static STRPTR *unit_dropdown_labels = NULL;
    or from a saved profile loaded at startup before any Discover click. */
 static char scanner_host[64] = "";
 static int  scanner_port = 80;
+static char scanner_root[128] = "/eSCL";
 static char scanner_make_model[96] = "";
 static BOOL have_capabilities = FALSE;
 
@@ -152,11 +157,12 @@ static const char *color_all_values[COLOR_MODE_COUNT] = { "RGB24", "Grayscale8",
    that did. Instead: keep the dropdown static, and validate/snap
    against what the scanner actually supports right when the request is
    built - see resolve_dpi() and resolve_color_value(). */
-static const int dpi_gui_values[] = { 100, 150, 200, 300, 600 };
+static const int dpi_gui_values[] = { 100, 150, 200, 300, 400, 600 };
 static STRPTR dpi_gui_labels[] = {
-    (STRPTR)"100", (STRPTR)"150", (STRPTR)"200", (STRPTR)"300", (STRPTR)"600", NULL
+    (STRPTR)"100", (STRPTR)"150", (STRPTR)"200", (STRPTR)"300",
+    (STRPTR)"400", (STRPTR)"600", NULL
 };
-#define DPI_GUI_COUNT 5
+#define DPI_GUI_COUNT 6
 
 static STRPTR format_labels[] = { (STRPTR)"JPEG", (STRPTR)"PNG", (STRPTR)"PDF", NULL };
 static const char *format_mimes[] = { "image/jpeg", "image/png", "application/pdf" };
@@ -219,6 +225,7 @@ static struct Gadget *find_gadget_by_id(struct Window *win, int id);
 static struct Gadget *find_model_gadget(struct Window *win);
 static void rebuild_scanner_dropdown(void);
 static void refresh_status_gadget(void);
+static void refresh_model_gadget(void);
 
 /* --------------------------------------------------------------------
  * Status output box
@@ -394,6 +401,8 @@ static BOOL write_config_file(CONST_STRPTR filename, int idx) {
     FPuts(file, (STRPTR)line);
     snprintf(line, sizeof(line), "PORT=%d\n", scanner_port);
     FPuts(file, (STRPTR)line);
+    snprintf(line, sizeof(line), "ROOT=%s\n", scanner_root);
+    FPuts(file, (STRPTR)line);
     snprintf(line, sizeof(line), "MODEL=%s\n", scanner_make_model);
     FPuts(file, (STRPTR)line);
     snprintf(line, sizeof(line), "SOURCE=%s\n", source_values[source_index]);
@@ -440,6 +449,8 @@ static BOOL save_config(void) {
 static void reset_unit_defaults(void) {
     scanner_host[0] = '\0';
     scanner_port = 80;
+    strncpy(scanner_root, "/eSCL", sizeof(scanner_root) - 1);
+    scanner_root[sizeof(scanner_root) - 1] = '\0';
     scanner_make_model[0] = '\0';
     source_index = 0;
     color_index = 0;
@@ -484,6 +495,11 @@ static BOOL load_unit_config(int idx) {
         } else if (strncmp(line, "PORT=", 5) == 0) {
             int p = atoi(line + 5);
             if (p >= 1 && p <= 65535) scanner_port = p;
+        } else if (strncmp(line, "ROOT=", 5) == 0) {
+            if (line[5]) {
+                strncpy(scanner_root, line + 5, sizeof(scanner_root) - 1);
+                scanner_root[sizeof(scanner_root) - 1] = '\0';
+            }
         } else if (strncmp(line, "MODEL=", 6) == 0) {
             strncpy(scanner_make_model, line + 6, sizeof(scanner_make_model) - 1);
             scanner_make_model[sizeof(scanner_make_model) - 1] = '\0';
@@ -515,6 +531,9 @@ static BOOL load_unit_config(int idx) {
     if (scanner_host[0]) {
         strncpy(discovered[0].ip, scanner_host, sizeof(discovered[0].ip) - 1);
         discovered[0].ip[sizeof(discovered[0].ip) - 1] = '\0';
+        discovered[0].port = scanner_port;
+        strncpy(discovered[0].root, scanner_root, sizeof(discovered[0].root) - 1);
+        discovered[0].root[sizeof(discovered[0].root) - 1] = '\0';
         /* Just the IP, not "IP (Model)" - the Model field right below the
            Scanner dropdown already shows the model name, and the combined
            label was long enough (a real make/model easily runs past 20
@@ -647,20 +666,20 @@ static void reload_current_unit(struct Window *win) {
 /* --------------------------------------------------------------------
  * LAN scanner discovery (mDNS / Bonjour / AirScan)
  *
- * Same shape as MintPRINT's mDNS printer discovery: a hand-built DNS PTR
- * query with the "QU" unicast-response bit set, so this never needs to
- * join the 224.0.0.251 multicast group to see replies. Deliberately does
- * not decode SRV/TXT records - a reply's source address is enough to
- * populate the picker; ScannerCapabilities after selection supplies the
- * real details. Queries both _uscan._tcp (eSCL/HTTP, the common case)
- * and _uscans._tcp (eSCL/HTTPS - discovered here, but not yet reachable,
- * see docs/ARCHITECTURE.md).
+ * A unicast-response PTR query avoids joining the multicast group. The
+ * response parser honours SRV ports and the eSCL TXT "rs=" root instead
+ * of assuming port 80 and /eSCL. TLS-only _uscans services are not listed
+ * until MintSCAN has HTTPS support.
  * ----------------------------------------------------------------- */
 
-static BOOL discovery_ip_seen(int count, const char *ip) {
+static BOOL discovery_endpoint_seen(int count, const char *ip, int port,
+                                    const char *root) {
     int i;
     for (i = 0; i < count; i++) {
-        if (strcmp(discovered[i].ip, ip) == 0) return TRUE;
+        if (strcmp(discovered[i].ip, ip) == 0 &&
+            discovered[i].port == port &&
+            strcmp(discovered[i].root, root) == 0)
+            return TRUE;
     }
     return FALSE;
 }
@@ -678,31 +697,29 @@ static int build_mdns_ptr_query(unsigned char *buf, int buf_size, const char **l
 
     for (i = 0; labels[i]; i++) {
         int len = (int)strlen(labels[i]);
+        if (len > 63 || off + len + 6 >= buf_size) return 0;
         buf[off++] = (unsigned char)len;
         memcpy(buf + off, labels[i], len);
         off += len;
     }
     buf[off++] = 0x00;
-
     buf[off++] = 0x00; buf[off++] = 0x0C; /* QTYPE = PTR */
-    buf[off++] = 0x80; buf[off++] = 0x01; /* QCLASS = IN, QU bit set */
-
+    buf[off++] = 0x80; buf[off++] = 0x01; /* QCLASS = IN, QU bit */
     return off;
 }
 
-static int mdns_discover_scanners(int count_io, int max_results, const char **labels,
-                                   const char *tag) {
+static int mdns_discover_scanners(int count_io, int max_results,
+                                  const char **labels) {
     int sockfd;
     struct sockaddr_in dest;
     unsigned char query[64];
     int query_len;
-    char *buf;
+    unsigned char *buf;
     int count = count_io;
     int poll_num;
-    const int max_polls = 10; /* ~500ms per poll => ~5s total scan time */
+    const int max_polls = 10;
 
     if (count >= max_results) return count;
-
     query_len = build_mdns_ptr_query(query, sizeof(query), labels);
     if (query_len <= 0) return count;
 
@@ -719,12 +736,12 @@ static int mdns_discover_scanners(int count_io, int max_results, const char **la
 
     if (sendto(sockfd, (char *)query, query_len, 0,
                (struct sockaddr *)&dest, sizeof(dest)) < 0) {
-        printf("Discovery: mDNS send failed (no route to 224.0.0.251?)\n");
+        printf("Discovery: mDNS send failed (no route to multicast?)\n");
         CloseSocket(sockfd);
         return count;
     }
 
-    buf = malloc(1024);
+    buf = malloc(2048);
     if (!buf) { CloseSocket(sockfd); return count; }
 
     for (poll_num = 0; poll_num < max_polls && count < max_results; poll_num++) {
@@ -734,9 +751,11 @@ static int mdns_discover_scanners(int count_io, int max_results, const char **la
         struct sockaddr_in from;
         socklen_t fromlen;
         ssize_t received;
+        struct MSMdnsEndpoint endpoint;
+        char ipstr[16];
+        const unsigned char *address;
 
         drain_gui_events();
-
         FD_ZERO(&readfds);
         FD_SET(sockfd, &readfds);
         tv.tv_sec = 0;
@@ -746,25 +765,44 @@ static int mdns_discover_scanners(int count_io, int max_results, const char **la
 
         fromlen = sizeof(from);
         memset(&from, 0, sizeof(from));
-        received = recvfrom(sockfd, buf, 1023, 0, (struct sockaddr *)&from, &fromlen);
+        received = recvfrom(sockfd, (char *)buf, 2048, 0,
+                            (struct sockaddr *)&from, &fromlen);
         if (received < 12 || from.sin_port != htons(5353)) continue;
-        if (buf[6] == 0 && buf[7] == 0) continue; /* ANCOUNT == 0 */
 
-        {
-            char ipstr[16];
-            const unsigned char *b = (const unsigned char *)&from.sin_addr;
+        memset(&endpoint, 0, sizeof(endpoint));
+        endpoint.port = 80;
+        strncpy(endpoint.path, "/eSCL", sizeof(endpoint.path) - 1);
+        if (!ms_mdns_parse_endpoint(buf, (size_t)received, &endpoint) ||
+            !endpoint.is_escl)
+            continue;
 
-            snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
-            if (b[0] == 127) continue;
+        address = (const unsigned char *)&from.sin_addr;
+        if (address[0] == 127) continue;
+        snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
+                 address[0], address[1], address[2], address[3]);
 
-            if (!discovery_ip_seen(count, ipstr)) {
-                strncpy(discovered[count].ip, ipstr, sizeof(discovered[count].ip) - 1);
-                discovered[count].ip[sizeof(discovered[count].ip) - 1] = '\0';
-                snprintf(discovered[count].label, sizeof(discovered[count].label),
-                         "%s (%s)", ipstr, tag);
-                printf("Discovery: found %s\n", discovered[count].label);
-                count++;
+        if (!discovery_endpoint_seen(count, ipstr, endpoint.port,
+                                     endpoint.path)) {
+            strncpy(discovered[count].ip, ipstr,
+                    sizeof(discovered[count].ip) - 1);
+            discovered[count].ip[sizeof(discovered[count].ip) - 1] = '\0';
+            discovered[count].port = endpoint.port;
+            strncpy(discovered[count].root, endpoint.path,
+                    sizeof(discovered[count].root) - 1);
+            discovered[count].root[sizeof(discovered[count].root) - 1] = '\0';
+
+            if (endpoint.label[0]) {
+                snprintf(discovered[count].label,
+                         sizeof(discovered[count].label), "%s (%s:%d)",
+                         endpoint.label, ipstr, endpoint.port);
+            } else {
+                snprintf(discovered[count].label,
+                         sizeof(discovered[count].label), "%s:%d",
+                         ipstr, endpoint.port);
             }
+            printf("Discovery: found %s at %s\n",
+                   discovered[count].label, discovered[count].root);
+            count++;
         }
     }
 
@@ -926,7 +964,9 @@ static void select_discovered_scanner(int idx) {
     if (idx < 0 || idx >= discovered_count) return;
     strncpy(scanner_host, discovered[idx].ip, sizeof(scanner_host) - 1);
     scanner_host[sizeof(scanner_host) - 1] = '\0';
-    scanner_port = 80;
+    scanner_port = discovered[idx].port;
+    strncpy(scanner_root, discovered[idx].root, sizeof(scanner_root) - 1);
+    scanner_root[sizeof(scanner_root) - 1] = '\0';
 }
 
 /* Parses "host" or "host:port" out of the IP entry field. Returns FALSE
@@ -970,12 +1010,17 @@ static int add_or_select_manual_ip(const char *host, int port) {
         discovered[idx].ip[sizeof(discovered[idx].ip) - 1] = '\0';
     }
     if (idx >= 0) {
-        snprintf(discovered[idx].label, sizeof(discovered[idx].label), "%s (manual)", host);
+        discovered[idx].port = port;
+        strncpy(discovered[idx].root, "/eSCL", sizeof(discovered[idx].root) - 1);
+        discovered[idx].root[sizeof(discovered[idx].root) - 1] = '\0';
+        snprintf(discovered[idx].label, sizeof(discovered[idx].label), "%s:%d (manual)", host, port);
     }
 
     strncpy(scanner_host, host, sizeof(scanner_host) - 1);
     scanner_host[sizeof(scanner_host) - 1] = '\0';
     scanner_port = port;
+    strncpy(scanner_root, "/eSCL", sizeof(scanner_root) - 1);
+    scanner_root[sizeof(scanner_root) - 1] = '\0';
 
     rebuild_scanner_dropdown();
     return idx;
@@ -1153,15 +1198,45 @@ static ssize_t send_timeout(int sockfd, const char *buf, int len, int timeout_se
     return total;
 }
 
-/* GET request. On success returns the HTTP status code and leaves the
-   response body (headers stripped) in response[]. */
+/* Builds an eSCL resource path from the root advertised by DNS-SD
+   (normally /eSCL, but not required to be). */
+static void build_escl_path(const char *suffix, char *out, int out_size) {
+    char root[128];
+    int len;
+
+    if (!scanner_root[0]) {
+        strncpy(root, "/eSCL", sizeof(root) - 1);
+        root[sizeof(root) - 1] = '\0';
+    } else if (scanner_root[0] == '/') {
+        strncpy(root, scanner_root, sizeof(root) - 1);
+        root[sizeof(root) - 1] = '\0';
+    } else {
+        snprintf(root, sizeof(root), "/%s", scanner_root);
+    }
+
+    len = (int)strlen(root);
+    while (len > 1 && root[len - 1] == '/') root[--len] = '\0';
+    if (!suffix || !suffix[0]) {
+        strncpy(out, root, out_size - 1);
+        out[out_size - 1] = '\0';
+    } else {
+        snprintf(out, out_size, "%s%s%s", root,
+                 suffix[0] == '/' ? "" : "/", suffix);
+    }
+}
+
+/* GET request. On success returns the final HTTP status code and leaves
+   a complete, decoded response body in response[]. */
 static int http_get(const char *ip, int port, const char *path,
-                     char *response, int maxlen) {
+                    char *response, int maxlen) {
     int sockfd;
     char header[512];
     int total = 0;
-    char *body;
     int status = -1;
+    int body_off = 0;
+    int body_len = 0;
+    int complete;
+    BOOL orderly_close = FALSE;
 
     sockfd = http_connect(ip, port);
     if (sockfd < 0) {
@@ -1170,47 +1245,68 @@ static int http_get(const char *ip, int port, const char *path,
     }
 
     snprintf(header, sizeof(header),
-             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, ip);
-
+             "GET %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n",
+             path, ip, port);
     if (send_timeout(sockfd, header, (int)strlen(header), 8) < 0) {
         CloseSocket(sockfd);
         return -1;
     }
 
     while (total < maxlen - 1) {
-        ssize_t received = recv_timeout(sockfd, response + total, maxlen - 1 - total, 8);
+        ssize_t received = recv_timeout(sockfd, response + total,
+                                        maxlen - 1 - total, 8);
         if (received > 0) {
-            total += received;
+            total += (int)received;
             response[total] = '\0';
         } else {
-            break; /* connection closed, or a real error - either way, done */
+            if (received == 0) orderly_close = TRUE;
+            break;
         }
     }
     CloseSocket(sockfd);
 
     if (total == 0) return -1;
-    response[total] = '\0';
+    complete = ms_http_final_body(response, total, &status,
+                                  &body_off, &body_len);
+    if (complete != 1 || body_len >= maxlen) return -1;
 
-    sscanf(response, "HTTP/%*d.%*d %d", &status);
-    body = strstr(response, "\r\n\r\n");
-    if (body) {
-        body += 4;
-        memmove(response, body, strlen(body) + 1);
+    /* An unframed response is only complete after an orderly close. */
+    {
+        int header_start = 0;
+        int candidate_body;
+        for (;;) {
+            int candidate_status;
+            candidate_body = ms_http_find_body(response, total, header_start);
+            if (candidate_body < 0) return -1;
+            candidate_status = ms_http_status(response, total, header_start);
+            if (candidate_status >= 200) break;
+            header_start = candidate_body;
+        }
+        if (ms_http_content_length(response, header_start, candidate_body) < 0 &&
+            !ms_http_header_has_token(response, header_start, candidate_body,
+                                      "Transfer-Encoding", "chunked") &&
+            !orderly_close)
+            return -1;
     }
+
+    memmove(response, response + body_off, (size_t)body_len);
+    response[body_len] = '\0';
     return status;
 }
 
-/* POST with an XML body. On success (201 Created for ScanJobs) fills in
-   location[] from the response's Location header. */
+/* POST with an XML body. Interim 1xx replies are skipped; Location is
+   matched case-insensitively in the final response header. */
 static int http_post_xml(const char *ip, int port, const char *path,
-                          const char *body_in, char *location, int location_size) {
+                         const char *body_in, char *location,
+                         int location_size) {
     int sockfd;
     char header[512];
     char response[2048];
     int total = 0;
     int status = -1;
-    char *loc_hdr;
+    BOOL final_header = FALSE;
 
+    location[0] = '\0';
     sockfd = http_connect(ip, port);
     if (sockfd < 0) {
         printf("Connect failed: %s:%d\n", ip, port);
@@ -1218,9 +1314,9 @@ static int http_post_xml(const char *ip, int port, const char *path,
     }
 
     snprintf(header, sizeof(header),
-             "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: text/xml\r\n"
+             "POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: text/xml\r\n"
              "Content-Length: %d\r\nConnection: close\r\n\r\n",
-             path, ip, (int)strlen(body_in));
+             path, ip, port, (int)strlen(body_in));
 
     if (send_timeout(sockfd, header, (int)strlen(header), 8) < 0 ||
         send_timeout(sockfd, body_in, (int)strlen(body_in), 8) < 0) {
@@ -1228,42 +1324,36 @@ static int http_post_xml(const char *ip, int port, const char *path,
         return -1;
     }
 
-    while (total < (int)sizeof(response) - 1) {
-        ssize_t received = recv_timeout(sockfd, response + total, sizeof(response) - 1 - total, 8);
-        if (received > 0) {
-            total += received;
-            response[total] = '\0';
-            if (strstr(response, "\r\n\r\n")) break; /* don't need the body here */
-        } else {
+    while (total < (int)sizeof(response) - 1 && !final_header) {
+        ssize_t received = recv_timeout(sockfd, response + total,
+                                        (int)sizeof(response) - 1 - total, 8);
+        int header_start = 0;
+        int body_off;
+
+        if (received <= 0) break;
+        total += (int)received;
+        response[total] = '\0';
+
+        while ((body_off = ms_http_find_body(response, total,
+                                             header_start)) >= 0) {
+            int candidate = ms_http_status(response, total, header_start);
+            if (candidate < 100 || candidate > 999) break;
+            if (candidate < 200) {
+                header_start = body_off;
+                continue;
+            }
+            status = candidate;
+            ms_http_copy_header(response, header_start, body_off,
+                                "Location", location, location_size);
+            final_header = TRUE;
             break;
         }
     }
+
     CloseSocket(sockfd);
-
-    if (total == 0) return -1;
-    response[total] = '\0';
-    sscanf(response, "HTTP/%*d.%*d %d", &status);
-
-    location[0] = '\0';
-    loc_hdr = strstr(response, "Location:");
-    if (!loc_hdr) loc_hdr = strstr(response, "location:");
-    if (loc_hdr) {
-        char *end;
-        loc_hdr += 9;
-        while (*loc_hdr == ' ') loc_hdr++;
-        end = strstr(loc_hdr, "\r\n");
-        if (end) {
-            int len = (int)(end - loc_hdr);
-            if (len >= location_size) len = location_size - 1;
-            memcpy(location, loc_hdr, len);
-            location[len] = '\0';
-        }
-    }
-    return status;
+    return final_header ? status : -1;
 }
 
-/* Best-effort job cleanup - failure here is not fatal, most scanners
-   expire an unclaimed job on their own after a timeout. */
 static void http_delete(const char *ip, int port, const char *path) {
     int sockfd;
     char header[512];
@@ -1278,16 +1368,18 @@ static void http_delete(const char *ip, int port, const char *path) {
        send the request and close; the scanner will time the job out
        on its own if this doesn't land. */
     snprintf(header, sizeof(header),
-             "DELETE %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, ip);
+             "DELETE %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n", path, ip, port);
     send_timeout(sockfd, header, (int)strlen(header), 8);
     CloseSocket(sockfd);
 }
 
-/* Strips a possible "http://host[:port]" prefix off a Location header
-   value, leaving just the path - scanners are inconsistent about
-   returning an absolute URL vs. a bare path here. */
-static void normalize_location_path(const char *location, char *path_out, int path_size) {
+/* Normalises an absolute or relative ScanJobs Location value to a
+   request path. Relative locations are resolved below the advertised
+   eSCL root. */
+static void normalize_location_path(const char *location, char *path_out,
+                                    int path_size) {
     const char *p = location;
+
     if (strncmp(p, "http://", 7) == 0) {
         p += 7;
         p = strchr(p, '/');
@@ -1297,22 +1389,24 @@ static void normalize_location_path(const char *location, char *path_out, int pa
         p = strchr(p, '/');
         if (!p) p = "/";
     }
-    strncpy(path_out, p, path_size - 1);
-    path_out[path_size - 1] = '\0';
+
+    if (p[0] == '/') {
+        strncpy(path_out, p, path_size - 1);
+        path_out[path_size - 1] = '\0';
+    } else {
+        build_escl_path(p, path_out, path_size);
+    }
 }
 
-/* Chunked-transfer decoder for NextDocument responses. Several real
-   eSCL scanners (Brother's included) send "Transfer-Encoding: chunked"
-   instead of Content-Length here - without decoding it, the hex chunk-
-   size lines and CRLF framing end up written into the file as if they
-   were image bytes, producing a file that's roughly the right size but
-   corrupt (the symptom that led to this). */
-enum ChunkState { CS_SIZE, CS_SIZE_CR, CS_DATA, CS_DATA_CR, CS_DATA_LF, CS_DONE };
+enum ChunkState {
+    CS_SIZE, CS_SIZE_EXT, CS_SIZE_LF, CS_DATA,
+    CS_DATA_CR, CS_DATA_LF, CS_DONE, CS_ERROR
+};
 
 struct ChunkDecoder {
     enum ChunkState state;
     long remaining;
-    char sizebuf[16];
+    char sizebuf[12];
     int sizelen;
 };
 
@@ -1322,46 +1416,82 @@ static void chunk_decoder_init(struct ChunkDecoder *cd) {
     cd->sizelen = 0;
 }
 
-/* Feeds len raw (still chunk-encoded) bytes through the decoder, writing
-   only the actual payload - not the size lines or chunk CRLFs - to
-   outfile. Returns TRUE once the terminating 0-length chunk has been
-   seen. Trailer headers after that chunk (rare - most servers just send
-   "0\r\n\r\n") are not parsed; anything after it is ignored. */
-static BOOL chunk_decoder_feed(struct ChunkDecoder *cd, const char *buf, int len,
-                                BPTR outfile, long *written) {
+static BOOL write_file_all(BPTR file, const char *data, int len) {
+    int done = 0;
+    while (done < len) {
+        LONG n = Write(file, (APTR)(data + done), len - done);
+        if (n <= 0) return FALSE;
+        done += (int)n;
+    }
+    return TRUE;
+}
+
+/* Returns 1 at the terminal zero chunk, 0 when more data is needed, and
+   -1 for malformed framing or a disk write failure. Chunk extensions may
+   cross receive boundaries. */
+static int chunk_decoder_feed(struct ChunkDecoder *cd, const char *buf, int len,
+                              BPTR outfile, long *written) {
     int i = 0;
 
     while (i < len) {
+        char c = buf[i];
         switch (cd->state) {
         case CS_SIZE:
-            if (buf[i] == '\r') {
-                cd->state = CS_SIZE_CR;
-                i++;
-            } else if (buf[i] == ';') {
-                while (i < len && buf[i] != '\r') i++;
-            } else {
-                if (cd->sizelen < (int)sizeof(cd->sizebuf) - 1) {
-                    cd->sizebuf[cd->sizelen++] = buf[i];
+            if ((c >= '0' && c <= '9') ||
+                (c >= 'a' && c <= 'f') ||
+                (c >= 'A' && c <= 'F')) {
+                if (cd->sizelen >= (int)sizeof(cd->sizebuf) - 1) {
+                    cd->state = CS_ERROR;
+                    return -1;
                 }
+                cd->sizebuf[cd->sizelen++] = c;
                 i++;
+            } else if (c == ';' && cd->sizelen > 0) {
+                cd->state = CS_SIZE_EXT;
+                i++;
+            } else if (c == '\r' && cd->sizelen > 0) {
+                cd->state = CS_SIZE_LF;
+                i++;
+            } else {
+                cd->state = CS_ERROR;
+                return -1;
             }
             break;
 
-        case CS_SIZE_CR:
-            if (buf[i] != '\n') { cd->state = CS_DONE; return TRUE; }
+        case CS_SIZE_EXT:
+            if (c == '\r') cd->state = CS_SIZE_LF;
+            i++;
+            break;
+
+        case CS_SIZE_LF:
+            if (c != '\n') {
+                cd->state = CS_ERROR;
+                return -1;
+            }
             cd->sizebuf[cd->sizelen] = '\0';
             cd->remaining = strtol(cd->sizebuf, NULL, 16);
             cd->sizelen = 0;
             i++;
-            if (cd->remaining == 0) { cd->state = CS_DONE; return TRUE; }
+            if (cd->remaining < 0) {
+                cd->state = CS_ERROR;
+                return -1;
+            }
+            if (cd->remaining == 0) {
+                cd->state = CS_DONE;
+                return 1;
+            }
             cd->state = CS_DATA;
             break;
 
         case CS_DATA: {
             int avail = len - i;
-            int take = (cd->remaining < (long)avail) ? (int)cd->remaining : avail;
+            int take = cd->remaining < (long)avail ?
+                       (int)cd->remaining : avail;
             if (take > 0) {
-                Write(outfile, (APTR)(buf + i), take);
+                if (!write_file_all(outfile, buf + i, take)) {
+                    cd->state = CS_ERROR;
+                    return -1;
+                }
                 *written += take;
                 cd->remaining -= take;
                 i += take;
@@ -1371,43 +1501,72 @@ static BOOL chunk_decoder_feed(struct ChunkDecoder *cd, const char *buf, int len
         }
 
         case CS_DATA_CR:
+            if (c != '\r') {
+                cd->state = CS_ERROR;
+                return -1;
+            }
             cd->state = CS_DATA_LF;
             i++;
             break;
 
         case CS_DATA_LF:
+            if (c != '\n') {
+                cd->state = CS_ERROR;
+                return -1;
+            }
             cd->state = CS_SIZE;
             i++;
             break;
 
         case CS_DONE:
-            return TRUE;
+            return 1;
+
+        case CS_ERROR:
+            return -1;
         }
     }
-    return cd->state == CS_DONE;
+    return cd->state == CS_DONE ? 1 : 0;
 }
 
-/* Downloads NextDocument straight to disk, splitting the HTTP header
-   from the binary body as bytes arrive rather than buffering the whole
-   image in memory first. Honours Content-Length or Transfer-Encoding:
-   chunked when the server sends either; otherwise reads until the
-   connection closes. */
-static BOOL download_next_document(const char *ip, int port, const char *job_path,
-                                    const char *save_path, long *bytes_out) {
+static BOOL write_unframed_body(BPTR outfile, const char *data, int len,
+                                long content_length, long *written) {
+    int take = len;
+    if (content_length >= 0) {
+        long left = content_length - *written;
+        if (left <= 0) return TRUE;
+        if ((long)take > left) take = (int)left;
+    }
+    if (take > 0 && !write_file_all(outfile, data, take)) return FALSE;
+    *written += take;
+    return TRUE;
+}
+
+/* Streams NextDocument to disk and only reports success when the response
+   framing proves the file is complete: exact Content-Length, a terminal
+   chunk, or an orderly close for an unframed response. Partial files are
+   removed on timeout, malformed framing, write error, or close failure. */
+static BOOL download_next_document(const char *ip, int port,
+                                   const char *job_path,
+                                   const char *save_path, long *bytes_out) {
     int sockfd;
     char header[512];
     char chunk[4096];
-    char headbuf[2048];
+    char headbuf[4096];
     int headlen = 0;
     BOOL header_done = FALSE;
     BOOL is_chunked = FALSE;
-    BOOL chunked_done = FALSE;
+    BOOL orderly_close = FALSE;
+    BOOL io_ok = TRUE;
+    int chunk_result = 0;
     struct ChunkDecoder cd;
     long content_length = -1;
     long written = 0;
     BPTR outfile;
     int status = -1;
+    BOOL close_ok;
+    BOOL complete;
 
+    *bytes_out = 0;
     sockfd = http_connect(ip, port);
     if (sockfd < 0) {
         printf("Connect failed for NextDocument\n");
@@ -1415,8 +1574,8 @@ static BOOL download_next_document(const char *ip, int port, const char *job_pat
     }
 
     snprintf(header, sizeof(header),
-             "GET %s/NextDocument HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
-             job_path, ip);
+             "GET %s/NextDocument HTTP/1.1\r\nHost: %s:%d\r\n"
+             "Connection: close\r\n\r\n", job_path, ip, port);
     if (send_timeout(sockfd, header, (int)strlen(header), 8) < 0) {
         CloseSocket(sockfd);
         return FALSE;
@@ -1430,91 +1589,104 @@ static BOOL download_next_document(const char *ip, int port, const char *job_pat
     }
 
     for (;;) {
-        ssize_t received;
-        received = recv_timeout(sockfd, chunk, sizeof(chunk), 8);
-        if (received <= 0) break;
+        ssize_t received = recv_timeout(sockfd, chunk, sizeof(chunk), 8);
+
+        if (received == 0) {
+            orderly_close = TRUE;
+            break;
+        }
+        if (received < 0) break;
 
         if (!header_done) {
-            int copy = (int)received;
-            char *term;
+            int header_start = 0;
+            int body_off = -1;
 
-            if (headlen + copy > (int)sizeof(headbuf) - 1) {
-                copy = (int)sizeof(headbuf) - 1 - headlen;
+            if (headlen + (int)received > (int)sizeof(headbuf)) {
+                printf("NextDocument: response header too large\n");
+                io_ok = FALSE;
+                break;
             }
-            memcpy(headbuf + headlen, chunk, copy);
-            headlen += copy;
-            headbuf[headlen] = '\0';
+            memcpy(headbuf + headlen, chunk, (size_t)received);
+            headlen += (int)received;
 
-            term = strstr(headbuf, "\r\n\r\n");
-            if (term) {
-                char *cl;
-                int header_bytes = (int)(term - headbuf) + 4;
-                int body_in_chunk = (int)received - (header_bytes - (headlen - copy));
-
-                sscanf(headbuf, "HTTP/%*d.%*d %d", &status);
-                cl = strstr(headbuf, "Content-Length:");
-                if (!cl) cl = strstr(headbuf, "content-length:");
-                if (cl) {
-                    cl += 15; /* strlen("Content-Length:") */
-                    while (*cl == ' ') cl++;
-                    content_length = atol(cl);
+            for (;;) {
+                int candidate_body =
+                    ms_http_find_body(headbuf, headlen, header_start);
+                int candidate_status;
+                if (candidate_body < 0) break;
+                candidate_status =
+                    ms_http_status(headbuf, headlen, header_start);
+                if (candidate_status < 100 || candidate_status > 999) {
+                    io_ok = FALSE;
+                    break;
                 }
-                {
-                    char *te = strstr(headbuf, "Transfer-Encoding:");
-                    if (!te) te = strstr(headbuf, "transfer-encoding:");
-                    if (te) {
-                        char line[64];
-                        char *lend = strstr(te, "\r\n");
-                        int linelen = lend ? (int)(lend - te) : (int)strlen(te);
-                        if (linelen >= (int)sizeof(line)) linelen = sizeof(line) - 1;
-                        memcpy(line, te, linelen);
-                        line[linelen] = '\0';
-                        if (strstr(line, "chunked") || strstr(line, "Chunked")) {
-                            is_chunked = TRUE;
-                            chunk_decoder_init(&cd);
-                        }
-                    }
+                if (candidate_status < 200) {
+                    header_start = candidate_body;
+                    continue;
                 }
-
+                status = candidate_status;
+                body_off = candidate_body;
+                is_chunked = ms_http_header_has_token(
+                    headbuf, header_start, body_off,
+                    "Transfer-Encoding", "chunked");
+                content_length = ms_http_content_length(
+                    headbuf, header_start, body_off);
                 header_done = TRUE;
+                break;
+            }
+            if (!io_ok) break;
+            if (!header_done) continue;
+            if (status != 200) {
+                printf("NextDocument returned status %d\n", status);
+                io_ok = FALSE;
+                break;
+            }
 
-                if (status != 200) {
-                    printf("NextDocument returned status %d\n", status);
-                    Close(outfile);
-                    DeleteFile((CONST_STRPTR)save_path);
-                    CloseSocket(sockfd);
-                    return FALSE;
-                }
-
-                if (body_in_chunk > 0) {
-                    if (is_chunked) {
-                        chunked_done = chunk_decoder_feed(&cd, chunk + (received - body_in_chunk),
-                                                           body_in_chunk, outfile, &written);
-                    } else {
-                        Write(outfile, chunk + (received - body_in_chunk), body_in_chunk);
-                        written += body_in_chunk;
-                    }
+            if (is_chunked) chunk_decoder_init(&cd);
+            if (headlen > body_off) {
+                int body_len = headlen - body_off;
+                if (is_chunked) {
+                    chunk_result = chunk_decoder_feed(
+                        &cd, headbuf + body_off, body_len,
+                        outfile, &written);
+                    if (chunk_result < 0) io_ok = FALSE;
+                } else if (!write_unframed_body(
+                               outfile, headbuf + body_off, body_len,
+                               content_length, &written)) {
+                    io_ok = FALSE;
                 }
             }
         } else if (is_chunked) {
-            chunked_done = chunk_decoder_feed(&cd, chunk, received, outfile, &written);
-        } else {
-            Write(outfile, chunk, received);
-            written += received;
+            chunk_result = chunk_decoder_feed(
+                &cd, chunk, (int)received, outfile, &written);
+            if (chunk_result < 0) io_ok = FALSE;
+        } else if (!write_unframed_body(
+                       outfile, chunk, (int)received,
+                       content_length, &written)) {
+            io_ok = FALSE;
         }
 
-        if (is_chunked) {
-            if (chunked_done) break;
-        } else if (content_length >= 0 && written >= content_length) {
+        if (!io_ok || (is_chunked && chunk_result == 1) ||
+            (!is_chunked && content_length >= 0 &&
+             written == content_length))
             break;
-        }
     }
 
-    Close(outfile);
     CloseSocket(sockfd);
+    close_ok = Close(outfile);
+    complete = io_ok && close_ok && header_done && status == 200 &&
+               written > 0 &&
+               ((is_chunked && chunk_result == 1) ||
+                (!is_chunked && content_length >= 0 &&
+                 written == content_length) ||
+                (!is_chunked && content_length < 0 && orderly_close));
 
-    if (!header_done) {
-        printf("NextDocument: no response\n");
+    if (!complete) {
+        if (!close_ok) printf("NextDocument: could not close output file\n");
+        else if (!io_ok) printf("NextDocument: invalid response or disk write failed\n");
+        else if (!header_done) printf("NextDocument: no complete response header\n");
+        else printf("NextDocument: transfer incomplete (%ld bytes)\n", written);
+        DeleteFile((CONST_STRPTR)save_path);
         return FALSE;
     }
 
@@ -1537,19 +1709,24 @@ static void refresh_status_gadget(void) {
     }
 }
 
-/* GET /eSCL/ScannerStatus and record just the top-level device state
-   (eSCL's pwg:State: Idle/Processing/Testing/Stopped/Down) - not the
-   per-job state further down the same document, which needs a job UUID
-   to correlate and isn't tracked here. Not fatal if this fails or the
-   element isn't present - ScannerStatus support is optional in some
-   firmware and its absence shouldn't block scanning. */
+static void refresh_model_gadget(void) {
+    struct Gadget *g = find_model_gadget(window);
+    if (g) {
+        GT_SetGadgetAttrs(g, window, NULL, GTTX_Text, (ULONG)scanner_make_model, TAG_DONE);
+    }
+}
+
+/* Query the advertised ScannerStatus endpoint. Failure is non-fatal;
+   status text is cleared so stale state is never shown for a new scanner. */
 static void query_scanner_status(const char *ip, int port) {
     char response[2048];
+    char path[192];
     int status;
     char *tag, *end;
 
     scanner_status_text[0] = '\0';
-    status = http_get(ip, port, "/eSCL/ScannerStatus", response, sizeof(response));
+    build_escl_path("ScannerStatus", path, sizeof(path));
+    status = http_get(ip, port, path, response, sizeof(response));
     if (status == 200) {
         tag = strstr(response, "<pwg:State>");
         if (tag) {
@@ -1557,7 +1734,8 @@ static void query_scanner_status(const char *ip, int port) {
             end = strstr(tag, "</");
             if (end) {
                 int len = (int)(end - tag);
-                if (len >= (int)sizeof(scanner_status_text)) len = sizeof(scanner_status_text) - 1;
+                if (len >= (int)sizeof(scanner_status_text))
+                    len = sizeof(scanner_status_text) - 1;
                 memcpy(scanner_status_text, tag, len);
                 scanner_status_text[len] = '\0';
             }
@@ -1567,42 +1745,49 @@ static void query_scanner_status(const char *ip, int port) {
 }
 
 static void query_capabilities(const char *ip, int port) {
+    char path[192];
     int status;
     char *tag, *end;
 
-    printf("Querying capabilities: %s:%d\n", ip, port);
+    printf("Querying capabilities: %s:%d%s\n", ip, port, scanner_root);
     have_capabilities = FALSE;
-    status = http_get(ip, port, "/eSCL/ScannerCapabilities", capabilities_xml, sizeof(capabilities_xml));
+    capabilities_xml[0] = '\0';
+    scanner_make_model[0] = '\0';
+    scanner_status_text[0] = '\0';
+    refresh_model_gadget();
+    refresh_status_gadget();
+
+    build_escl_path("ScannerCapabilities", path, sizeof(path));
+    status = http_get(ip, port, path,
+                      capabilities_xml, sizeof(capabilities_xml));
     if (status != 200) {
         printf("ScannerCapabilities failed (status %d)\n", status);
-        capabilities_xml[0] = '\0';
         return;
     }
 
-    scanner_make_model[0] = '\0';
     tag = strstr(capabilities_xml, "MakeAndModel>");
     if (tag) {
         tag += 13;
         end = strstr(tag, "</");
         if (end) {
             int len = (int)(end - tag);
-            if (len >= (int)sizeof(scanner_make_model)) len = sizeof(scanner_make_model) - 1;
+            if (len >= (int)sizeof(scanner_make_model))
+                len = sizeof(scanner_make_model) - 1;
             memcpy(scanner_make_model, tag, len);
             scanner_make_model[len] = '\0';
         }
     }
 
     have_capabilities = TRUE;
-    if (scanner_make_model[0]) {
+    refresh_model_gadget();
+    if (scanner_make_model[0])
         printf("Found: %s\n", scanner_make_model);
-    } else {
+    else
         printf("Capabilities OK (model name not found in response)\n");
-    }
 
     query_scanner_status(ip, port);
-    if (scanner_status_text[0]) {
+    if (scanner_status_text[0])
         printf("Scanner status: %s\n", scanner_status_text);
-    }
 }
 
 /* sane-airscan records DocumentFormatExt support per source and only
@@ -1631,19 +1816,12 @@ static void build_scan_settings_xml(char *buf, int buf_size) {
     BOOL use_document_format_ext = source_uses_document_format_ext();
     char format_ext[128];
 
-    /* BlackAndWhite1 (1-bit) is broken on real hardware - confirmed
-       scanner-side, not an Amiga/MintSCAN problem: windows_escl_probe.py
-       sending this exact request from a plain PC (no Amiga involved at
-       all) got back a JPEG that opens fine but is full RGB colour with
-       visible horizontal banding, despite explicitly requesting
-       BlackAndWhite1 - the scanner is just not honouring the requested
-       ColorMode for this value. MintSCAN never decodes the image itself
-       (NextDocument's bytes go straight to a file), so there was never
-       anything to fix in the download path - substitute Grayscale8,
-       which the same scanner does honour correctly. See
-       docs/ARCHITECTURE.md for the probe output this is based on. */
-    if (strcmp(color_value, "BlackAndWhite1") == 0) {
-        printf("Black & White doesn't display correctly here - using Grayscale instead\n");
+    /* Brother MFC-J6930DW firmware is known to return banded colour
+       data for BlackAndWhite1. Keep that workaround model-scoped so
+       conforming scanners still receive the requested 1-bit mode. */
+    if (strcmp(color_value, "BlackAndWhite1") == 0 &&
+        strstr(scanner_make_model, "MFC-J6930DW") != NULL) {
+        printf("This scanner mishandles Black & White - using Grayscale instead\n");
         color_value = "Grayscale8";
     }
 
@@ -1690,6 +1868,7 @@ static void build_scan_settings_xml(char *buf, int buf_size) {
 static void do_scan(void) {
     char xml[1024];
     char location[256];
+    char jobs_path[192];
     char job_path[256];
     long bytes_written = 0;
     int status;
@@ -1702,8 +1881,9 @@ static void do_scan(void) {
     build_scan_settings_xml(xml, sizeof(xml));
 
     printf("Starting scan job...\n");
-    status = http_post_xml(scanner_host, scanner_port, "/eSCL/ScanJobs", xml,
-                            location, sizeof(location));
+    build_escl_path("ScanJobs", jobs_path, sizeof(jobs_path));
+    status = http_post_xml(scanner_host, scanner_port, jobs_path, xml,
+                           location, sizeof(location));
     if (status != 201 || !location[0]) {
         query_scanner_status(scanner_host, scanner_port);
         if (scanner_status_text[0]) {
@@ -1729,25 +1909,35 @@ static void do_scan(void) {
 }
 
 static void do_discover(void) {
-    printf("Searching LAN for scanners (mDNS)...\n");
+    static const char *uscan_labels[] = {
+        "_uscan", "_tcp", "local", NULL
+    };
+
+    printf("Searching LAN for eSCL scanners (mDNS)...\n");
+
+    /* A fresh search must not leave an old endpoint scan-ready when it
+       returns no results. */
     discovered_count = 0;
+    scanner_host[0] = '\0';
+    scanner_port = 80;
+    strncpy(scanner_root, "/eSCL", sizeof(scanner_root) - 1);
+    scanner_root[sizeof(scanner_root) - 1] = '\0';
+    scanner_make_model[0] = '\0';
+    scanner_status_text[0] = '\0';
+    capabilities_xml[0] = '\0';
+    have_capabilities = FALSE;
+    refresh_model_gadget();
+    refresh_status_gadget();
 
-    {
-        static const char *uscan_labels[] = { "_uscan", "_tcp", "local", NULL };
-        static const char *uscans_labels[] = { "_uscans", "_tcp", "local", NULL };
-        discovered_count = mdns_discover_scanners(discovered_count, MAX_DISCOVERY_RESULTS,
-                                                   uscan_labels, "eSCL");
-        discovered_count = mdns_discover_scanners(discovered_count, MAX_DISCOVERY_RESULTS,
-                                                   uscans_labels, "eSCL/TLS");
-    }
-
+    discovered_count = mdns_discover_scanners(
+        discovered_count, MAX_DISCOVERY_RESULTS, uscan_labels);
     rebuild_scanner_dropdown();
 
     if (discovered_count > 0) {
         select_discovered_scanner(0);
         query_capabilities(scanner_host, scanner_port);
     } else {
-        printf("No scanners found\n");
+        printf("No HTTP eSCL scanners found\n");
     }
 }
 

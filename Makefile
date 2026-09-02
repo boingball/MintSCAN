@@ -1,44 +1,83 @@
-CROSS   ?= m68k-amigaos-
-CC       = $(CROSS)gcc
-CFLAGS  ?= -O2 -m68000 -Wall -Wextra -fomit-frame-pointer -fno-builtin
+CROSS      ?= m68k-amigaos-
+CC          = $(CROSS)gcc
+HOST_CC    ?= cc
+CFLAGS     ?= -O2 -m68000 -Wall -Wextra -fomit-frame-pointer -fno-builtin
+HOST_CFLAGS ?= -O2 -Wall -Wextra -pedantic
 
-.PHONY: all release clean help
+BUILD_DIR  := build
+TEST_DIR   := $(BUILD_DIR)/tests
+ART_DIR    := art
+RELEASE_DIR := release/MintSCAN
+
+.PHONY: all help check test-http test-mdns check-art release clean
 
 all: MintScan
 
 help:
 	@echo "MintSCAN targets:"
-	@echo "  make          - build MintScan"
-	@echo "  make release  - stage a distributable bundle in release/MintSCAN/"
+	@echo "  make           - build MintScan for m68k AmigaOS"
+	@echo "  make check     - run host-side HTTP and DNS-SD tests"
+	@echo "  make release   - validate artwork and stage the Aminet bundle"
 	@echo "  make clean"
 
-MintScan: src/MintScan.c
-	$(CC) $(CFLAGS) -o $@ src/MintScan.c -lamiga -lm
+MintScan: src/MintScan.c src/http_response.c src/http_response.h src/mdns_endpoint.c src/mdns_endpoint.h
+	$(CC) $(CFLAGS) -Isrc -o $@ src/MintScan.c src/http_response.c src/mdns_endpoint.c -lamiga -lm
 
-ART_DIR := art
-RELEASE_DIR := release/MintSCAN
+$(TEST_DIR):
+	mkdir -p $(TEST_DIR)
 
-# Mirrors MintPRINT's release layout: icons copied from art/ if present,
-# with the drawer's own icon staged in the parent of RELEASE_DIR per
-# AmigaOS convention (a drawer's icon lives next to the drawer, not
-# inside it).
-release: MintScan
+test-http: | $(TEST_DIR)
+	$(HOST_CC) $(HOST_CFLAGS) -Isrc -o $(TEST_DIR)/test_http_response tests/test_http_response.c src/http_response.c
+	$(TEST_DIR)/test_http_response
+
+test-mdns: | $(TEST_DIR)
+	$(HOST_CC) $(HOST_CFLAGS) -Isrc -o $(TEST_DIR)/test_mdns_endpoint tests/test_mdns_endpoint.c src/mdns_endpoint.c
+	$(TEST_DIR)/test_mdns_endpoint
+
+check: test-http test-mdns
+
+# Artwork is intentionally a hard release gate. The old repository files used
+# the same WBTOOL DiskObject as both application and drawer icons, which makes
+# the drawer invalid and causes the GNUmakefile geometry patch to modify the
+# wrong structure. See art/README.md before replacing the placeholders.
+check-art:
+	@test -f $(ART_DIR)/MintScan.info || { echo "Missing $(ART_DIR)/MintScan.info"; exit 1; }
+	@test -f $(ART_DIR)/MintSCAN.info || { echo "Missing $(ART_DIR)/MintSCAN.info"; exit 1; }
+	@test -f $(ART_DIR)/Install.info || { echo "Missing $(ART_DIR)/Install.info"; exit 1; }
+	@if cmp -s $(ART_DIR)/MintScan.info $(ART_DIR)/MintSCAN.info; then \
+		echo "ERROR: application and drawer icons are identical placeholders"; \
+		exit 1; \
+	fi
+	@set -e; \
+	app_type=$$(dd if=$(ART_DIR)/MintScan.info bs=1 skip=48 count=1 2>/dev/null | od -An -tu1 | tr -d ' \n'); \
+	drawer_type=$$(dd if=$(ART_DIR)/MintSCAN.info bs=1 skip=48 count=1 2>/dev/null | od -An -tu1 | tr -d ' \n'); \
+	install_type=$$(dd if=$(ART_DIR)/Install.info bs=1 skip=48 count=1 2>/dev/null | od -An -tu1 | tr -d ' \n'); \
+	app_stack=$$(dd if=$(ART_DIR)/MintScan.info bs=1 skip=74 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n'); \
+	test "$$app_type" = "3" || { echo "ERROR: MintScan.info must be WBTOOL (type 3), got $$app_type"; exit 1; }; \
+	test "$$drawer_type" = "2" || { echo "ERROR: MintSCAN.info must be WBDRAWER (type 2), got $$drawer_type"; exit 1; }; \
+	test "$$install_type" = "4" || { echo "ERROR: Install.info must be WBPROJECT (type 4), got $$install_type"; exit 1; }; \
+	test "$$app_stack" = "00020000" || { echo "ERROR: MintScan.info Stack must be 131072 bytes, got 0x$$app_stack"; exit 1; }
+	@echo "Artwork types and MintScan stack are valid"
+
+release: check MintScan check-art
+	rm -rf release
 	mkdir -p $(RELEASE_DIR)
 	cp MintScan $(RELEASE_DIR)/
-	@if [ -f $(ART_DIR)/MintScan.info ]; then \
-		cp $(ART_DIR)/MintScan.info $(RELEASE_DIR)/; \
-		echo "Copied $(ART_DIR)/MintScan.info -> $(RELEASE_DIR)/"; \
-	else \
-		echo "No $(ART_DIR)/MintScan.info found - application will have no icon"; \
-	fi
-	@if [ -f $(ART_DIR)/MintSCAN.info ]; then \
-		cp $(ART_DIR)/MintSCAN.info release/MintSCAN.info; \
-		echo "Copied $(ART_DIR)/MintSCAN.info -> release/MintSCAN.info (drawer icon)"; \
-	else \
-		echo "No $(ART_DIR)/MintSCAN.info found - release drawer will have no icon"; \
-	fi
+	cp $(ART_DIR)/MintScan.info $(RELEASE_DIR)/
+	cp docs/MintSCAN.guide $(RELEASE_DIR)/
+	cp LICENSE $(RELEASE_DIR)/
+	cp Install release/
+	cp $(ART_DIR)/Install.info release/
+	cp $(ART_DIR)/MintSCAN.info release/
+	cp Aminet/MintSCAN.readme release/
 	@echo
-	@echo "Release bundle staged in $(RELEASE_DIR)/"
+	@echo "MintSCAN 1.1.0 release staged under release/:"
+	@echo "  Install / Install.info"
+	@echo "  MintSCAN.info"
+	@echo "  MintSCAN.readme"
+	@echo "  MintSCAN/MintScan and MintScan.info"
+	@echo "  MintSCAN/MintSCAN.guide"
+	@echo "  MintSCAN/LICENSE"
 
 clean:
 	rm -rf build release MintScan
