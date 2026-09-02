@@ -1,157 +1,114 @@
 # MintSCAN architecture
 
-## Why no driver
+## Application shape
 
-MintPRINT needs a `DEVS:Printers/` driver because AmigaOS printing has a
-device abstraction (`printer.device`) that applications already talk to -
-the driver is what translates that into IPP. Scanning has no equivalent
-OS-level device class on classic AmigaOS for a network scanner to plug
-into, so there is nothing to intercept. MintSCAN is just an application
-that speaks eSCL directly and writes the result to a file.
+Classic AmigaOS has a standard printing device interface but no equivalent
+scanner device class. MintSCAN is therefore a standalone GadTools application,
+not a driver. It speaks eSCL directly through `bsdsocket.library` and streams
+the scanner-produced document to an AmigaDOS file.
 
-## eSCL flow
+## eSCL transaction
 
-```
-GET  /eSCL/ScannerCapabilities   -> capabilities XML (formats, resolutions, MakeAndModel)
-GET  /eSCL/ScannerStatus         -> idle/processing state (not yet used)
-POST /eSCL/ScanJobs              -> ScanSettings XML in, "Location" response header
-                                     out (the new job's URL)
-GET  {Location}/NextDocument     -> the scanned page, as the requested
-                                     DocumentFormat (JPEG/PNG/PDF)
-```
+| Step | Request | Purpose |
+|---|---|---|
+| 1 | `GET {root}/ScannerCapabilities` | Read model and advertised options |
+| 2 | `GET {root}/ScannerStatus` | Show the top-level scanner state |
+| 3 | `POST {root}/ScanJobs` | Create a job with compact ScanSettings XML |
+| 4 | `GET {Location}/NextDocument` | Stream one JPEG, PNG, or PDF page |
+| 5 | `DELETE {Location}` | Best-effort job cleanup |
 
-`ScanJobs` is a one-shot job today (single page, flatbed). ADF/multi-page
-would mean repeating `NextDocument` until the scanner returns 404 (no
-more pages) - not implemented yet.
+The conventional root is `/eSCL`, but discovery retains the DNS-SD TXT
+`rs=` value and SRV port. A relative ScanJobs `Location` is resolved below
+that root; an absolute path or URL is normalised to its request path.
 
-`pwg:ScanRegion`'s `pwg:ContentRegionUnits` was missing for a long time
-(only `Height`/`Width`/`XOffset`/`YOffset` were sent) - confirmed by
-testing that a real scanner would accept the job and return a valid
-image while silently ignoring every other requested field (resolution,
-colour mode) and falling back to its own defaults for all of them, no
-matter what was actually requested. That's consistent with a
-strict/fragile firmware parser failing region validation without an
-explicit units element and discarding the rest of the document rather
-than rejecting just that one field. `ContentRegionUnits` is now sent
-(first child of `ScanRegion`, matching its schema sequence), along with
-`scan:Intent` since it's commonly present in working real-world
-requests too. If a scanner still ignores requested values after this,
-`build_scan_settings_xml()`'s "Requesting: ..." status line is the
-place to check the built request actually matches what's expected
-next, rather than guessing at the XML shape again.
+All connect, send and receive operations are bounded with `WaitSelect()`.
+Connections receive one retry because sleeping Wi-Fi scanners may wake for the
+mDNS query before accepting TCP.
 
 ## Discovery
 
-mDNS-SD PTR query for `_uscan._tcp.local` (eSCL over HTTP) and
-`_uscans._tcp.local` (eSCL over HTTPS), sent unicast-response (QU bit
-set) so this never needs to join the 224.0.0.251 multicast group to see
-replies - same shape as MintPRINT's mDNS discovery. Like MintPRINT, this
-deliberately does not decode SRV/TXT records; a reply's source address is
-enough to populate the picker, and `ScannerCapabilities` after selection
-supplies the real details.
+MintSCAN sends a DNS-SD PTR query for `_uscan._tcp.local` with the QU bit.
+`src/mdns_endpoint.c` safely decodes compressed PTR, SRV and TXT records and
+extracts:
 
-eSCL scanners are not reliably discoverable via SSDP the way AirPrint
-printers are, so - unlike MintPRINT - there is no SSDP pass here.
+- the service instance;
+- SRV port;
+- TXT `rs=` eSCL root;
+- TXT `ty=` display label.
 
-mDNS multicast doesn't reach every environment - notably WinUAE's SLIRP
-networking, which doesn't route 224.0.0.251 (`no route to 224.0.0.251?`
-in the status box). The IP field next to Discover exists for exactly
-this: type an IP (or `ip:port`) and click Query to skip discovery
-entirely and go straight to `ScannerCapabilities`.
+The IPv4 source address of the mDNS reply is used for the connection.
+Endpoints are de-duplicated by address, port and root. TLS-only
+`_uscans._tcp` services are intentionally not listed until AmiSSL is wired
+into the HTTP client.
 
-## Known limitations / next steps
+Manual Query accepts an IPv4 address and optional port and uses `/eSCL`.
 
-- **`NextDocument` handles `Content-Length`, `Transfer-Encoding: chunked`,
-  and a server that just closes the connection when done.** The chunked
-  decoder is a plain, tolerant state machine (`chunk_decoder_feed()`) -
-  it doesn't parse trailer headers after the terminating 0-length chunk
-  (rare in practice; most servers send `0\r\n\r\n` and stop).
-- **HTTPS (`_uscans._tcp`) scanners are discovered but not actually
-  reachable** - eSCL-over-TLS needs AmiSSL wired into the HTTP client,
-  which isn't done yet. Plain-HTTP eSCL (`_uscan._tcp`, the common case)
-  works today.
-- **ADF and duplex are not implemented.** `ScanRegions` is always a
-  single full-page region at (0,0); there's no multi-page loop.
-- **`ScannerCapabilities` is only lightly scraped**, not fully parsed.
-  `pwg:MakeAndModel` (for display) comes straight from the raw response.
-  DPI (every `XResolution>NNN<` value) and Colour mode (whichever of
-  RGB24/Grayscale8/BlackAndWhite1 turn up) are scraped from whichever
-  Source is currently selected: `extract_source_block()` pulls out the
-  substring between `<scan:Platen>`/`<scan:Adf>` and its closing tag
-  (matching the Source dropdown) before `scrape_dpi_values()`/
-  `scrape_color_values()` run - a scanner can support different values
-  per source (e.g. higher DPI or colour modes on the ADF but not the
-  flatbed), and scraping the whole document conflated the two, which is
-  exactly why an offered/scraped value could still get silently rejected
-  by the scanner. Falls back to scraping the whole document if the
-  current Source isn't broken out as its own element (some
-  capabilities responses don't split them). Source/Format/Size have no
-  capability check at all.
+## HTTP and file integrity
 
-  **The DPI and Colour dropdowns themselves are always the same fixed
-  list** (`dpi_gui_values`/`color_all_labels`) - they are never rebuilt
-  from what's scraped. An earlier version tried swapping a live CYCLE_KIND
-  gadget's `GTCY_Labels`/`GTCY_Active` after a capabilities query to show
-  only supported values, and testing confirmed this breaks selection
-  entirely: the new labels display, but the gadget's internal
-  active-index tracking desyncs, so what you pick visually stops
-  corresponding to the index the code reads back - values shown but not
-  honoured. This is a known GadTools gotcha MintPRINT itself works
-  around by never live-updating a cycle gadget's label list once
-  created. Instead, `resolve_dpi()`/`resolve_color_value()` (called from
-  `build_scan_settings_xml()`) validate the selected value against what
-  that Source actually scraped and substitute the closest/first
-  supported one if needed. `build_scan_settings_xml()` also always
-  prints exactly what it's about to request (DPI/ColorMode/Source), not
-  just on substitution - if a scanner still ignores an honestly-supported
-  value, that line is the next thing to check, not which value got
-  picked client-side.
-- **Page sizes (A4/Letter/Legal/A3) are a fixed guess, not derived from
-  `MaxWidth`/`MaxHeight`.** A3 was added because a real scanner turned
-  out to support it, not because it's queried - a flatbed too small for
-  A3 would just get a `ScanRegions` request bigger than its bed.
+`src/http_response.c` provides allocation-free, case-insensitive HTTP/1.x
+helpers. Text requests handle interim 1xx replies, Content-Length, chunked
+transfer encoding and mixed-case headers.
 
-## Saved profiles: Unit0-7
+`NextDocument` uses a streaming chunk decoder so an image is never buffered
+whole in memory. Success requires one of:
 
-Same idea as MintPRINT's Unit0-7 printer switcher: up to 8 saved scanner
-profiles at `ENV(ARC):MintSCAN/UnitN`, picked with the `Unit:` cycle
-gadget. Unlike MintPRINT there's no background driver with its own idea
-of which Unit is "live" - MintSCAN is the only reader of these files, so
-whichever Unit is currently loaded in the GUI is simply what `Scan` uses
-next; there's no separate Activate step. Switching the dropdown
-(`reload_current_unit()`) resets every field to MintScan's built-in
-defaults, then loads that Unit's saved file over them if one exists -
-so an empty slot doesn't inherit whatever the previous Unit had typed
-into it. The dropdown's own labels (`refresh_unit_dropdown()`) show each
-slot's saved model name, peeked straight off disk without disturbing the
-live GUI state, matching MintPRINT's `peek_unit_model()`/
-`refresh_unit_dropdown()` pair.
+- exactly the declared Content-Length;
+- a terminal zero chunk with valid chunk framing; or
+- an orderly connection close when no framing header was supplied.
 
-## Wi-Fi scanners that sleep between jobs
+Every AmigaDOS `Write()` and final `Close()` is checked. A timeout,
+malformed response, truncated body, disk-full condition or close error removes
+the partial output file.
 
-`http_connect()` bounds every connect attempt with `connect_with_timeout()`
-- a non-blocking `connect()` polled via `WaitSelect()` rather than trusting
-however long the stack's own blocking connect() feels like taking - and
-retries once on failure before giving up. This is the same fix MintPRINT
-shipped for HP OfficeJet/Envy-class Wi-Fi printers that drop their radio
-into power-save between jobs: mDNS discovery still gets a reply because
-the radio wakes for multicast traffic, but the first real TCP SYN
-afterwards can be slow enough to blow past a single connect attempt even
-though the same device answers almost immediately once its radio is
-awake. A genuinely dead endpoint still fails fast via
-ECONNREFUSED/host-unreachable well inside the timeout, so the retry
-costs little.
+## Capabilities and request choices
 
-## Why every recv() goes through recv_timeout()
+The live GadTools cycle labels remain fixed. Replacing cycle label arrays after
+creation can desynchronise the displayed selection from the active index on the
+target GadTools versions.
 
-The app is single-threaded, so a `recv()` that never returns freezes the
-whole GUI - confirmed by testing: after a successful scan, the best-effort
-`ScanJobs` `DELETE` cleanup would sit forever in a `while (recv(...) > 0)`
-drain loop against a scanner that never replied to `DELETE` and never
-closed the connection. `SO_RCVTIMEO` is set on every socket, but isn't
-trusted alone to bound `recv()` - same caution the mDNS code already
-applies to UDP sockets, just not every bsdsocket.library stack honours it
-reliably for TCP either. `recv_timeout()` wraps every `recv()` in this
-file with an explicit `WaitSelect`, and `http_delete()` no longer reads a
-response at all (fire-and-forget - the scanner will expire the job on its
-own if the `DELETE` doesn't land).
+At scan time MintSCAN lightly scrapes the selected `scan:Platen` or
+`scan:Adf` block:
+
+- a supported discrete DPI is used, or the closest advertised DPI is chosen;
+- a supported colour mode is used, or the first advertised mode is chosen;
+- `DocumentFormatExt` is emitted only when advertised for that source.
+
+Source, document format and region size are currently fixed lists. The XML
+uses `escl:ThreeHundredthsOfInches` regions and is deliberately compact for
+firmware known to accept a job while silently defaulting malformed settings.
+
+Brother MFC-J6930DW firmware has been observed to advertise
+`BlackAndWhite1` but return banded RGB data. Only that model is substituted
+to `Grayscale8`; other scanners receive the selected 1-bit mode.
+
+## Saved state
+
+Unit0 through Unit7 are independent profiles in
+`ENV:MintSCAN/UnitN` and `ENVARC:MintSCAN/UnitN`. Each stores the endpoint
+address, port and root, model, selected options and destination path. Switching
+Unit resets defaults before loading, preventing fields from leaking between
+profiles.
+
+The Scanner cycle is separate: it represents the most recent live discovery
+(or one manual endpoint). A new discovery clears the previously active
+endpoint, model, status and capabilities so failure cannot leave an old scanner
+scan-ready.
+
+## Portable tests
+
+`make check` builds and runs host tests for the protocol-only modules:
+
+- HTTP status/header/framing and in-place chunk decoding;
+- DNS name compression plus PTR/SRV/TXT endpoint extraction.
+
+The Amiga GUI and bsdsocket integration still require the m68k cross-toolchain
+and target/emulator testing.
+
+## Current limitations
+
+- Plain HTTP only; no AmiSSL/HTTPS.
+- One page per operation; no ADF continuation loop or duplex.
+- No scan cancellation.
+- IPv4 literals only for manual Query.
+- Lightweight XML scraping rather than a full XML parser.
+- Fixed source, format and page-size lists.

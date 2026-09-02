@@ -1,0 +1,249 @@
+@database MintSCAN.guide
+@$VER: MintSCAN.guide 1.1.0 (02.09.2026)
+@author "MintSCAN project (boingball)"
+@(c) "Copyright (c) 2026 Darren Banfi (boingball). MIT License."
+@width 74
+
+@node Main "MintSCAN Help"
+@{b}MintSCAN 1.1.0@{ub}
+
+Modern eSCL/AirScan network scanning for classic AmigaOS.
+
+MintSCAN talks directly to a compatible network scanner or multifunction
+printer and saves the returned JPEG, PNG or PDF file on the Amiga. No PC
+scan server and no scanner-specific Amiga driver are required.
+
+@{"Requirements" LINK Requirements}
+@{"Installation" LINK Installation}
+@{"Quick start" LINK QuickStart}
+@{"Scanner profiles" LINK Profiles}
+@{"Scan options" LINK Options}
+@{"Saving files" LINK Saving}
+@{"Discovery and manual Query" LINK Discovery}
+@{"Status and error messages" LINK Status}
+@{"Known limitations" LINK Limitations}
+@{"Troubleshooting" LINK Troubleshooting}
+@{"Reporting a problem" LINK Reporting}
+@{"Version history" LINK History}
+
+@endnode
+
+@node Requirements "Requirements"
+@{b}Requirements@{ub}
+
+  * Motorola 68000 or later.
+  * AmigaOS 3.0 or later.
+  * A running TCP/IP stack providing bsdsocket.library.
+  * An eSCL/AirScan scanner reachable over plain HTTP.
+  * About 1 MiB of free memory is recommended.
+
+MintSCAN requests a 128 KiB stack. Use the supplied MintScan.info when
+starting from Workbench. Scanned image data is streamed directly to the
+destination file rather than being held completely in memory.
+
+HTTPS-only _uscans devices are not supported in 1.1.0 because AmiSSL has
+not yet been connected to the eSCL client.
+
+@{"Back to contents" LINK Main}
+@endnode
+
+@node Installation "Installation"
+@{b}Installation@{ub}
+
+Double-click Install and select a destination drawer, or copy the MintSCAN
+drawer manually wherever you prefer. The installer copies only MintSCAN,
+its icon, this guide and the licence. It does not install a driver or
+change any AmigaOS system files. No reboot is required.
+
+Saved profiles are written to ENV:MintSCAN/Unit0 through Unit7 and to the
+matching ENVARC: files for persistence after reboot.
+
+@{"Back to contents" LINK Main}
+@endnode
+
+@node QuickStart "Quick start"
+@{b}Quick start@{ub}
+
+  1. Start your TCP/IP stack.
+  2. Run MintScan.
+  3. Click Discover, or enter the scanner IPv4 address and click Query.
+  4. Confirm that Model and Status are populated.
+  5. Choose Source, Colour, DPI, Format and Size.
+  6. Choose a destination with Browse or type an AmigaDOS path.
+  7. Click Scan.
+  8. Use Save Config if you want to retain the settings in this Unit.
+
+The Scan button is disabled while the operation is running. A successful
+scan ends with the exact byte count and destination in the message box.
+
+@{"Back to contents" LINK Main}
+@endnode
+
+@node Profiles "Scanner profiles"
+@{b}Scanner profiles: Unit0 to Unit7@{ub}
+
+Each Unit is an independent saved scanner profile. A profile stores:
+
+  * IPv4 address, port and eSCL resource root.
+  * Scanner model.
+  * Source, colour mode, resolution, format and page size.
+  * Destination file path.
+
+Select a Unit, configure or discover the scanner, and press Save Config.
+Switching to another Unit loads its saved values immediately. There is no
+separate Activate step because MintSCAN has no background driver.
+
+@{"Back to contents" LINK Main}
+@endnode
+
+@node Options "Scan options"
+@{b}Scan options@{ub}
+
+Source
+  Flatbed (Platen) or Feeder (ADF). Version 1.1.0 retrieves one page only;
+  it does not loop through a multi-page feeder job.
+
+Colour
+  Colour (RGB24), Grayscale8 or BlackAndWhite1. MintSCAN validates colour
+  modes against the selected source when the scanner advertises them.
+  Brother MFC-J6930DW firmware advertises BlackAndWhite1 but returns a
+  damaged RGB image, so that model alone is changed to Grayscale8.
+
+DPI
+  100, 150, 200, 300, 400 or 600. If the chosen value is not advertised
+  for the selected source, MintSCAN uses the closest supported value and
+  reports the substitution.
+
+Format
+  JPEG, PNG or PDF. The scanner creates the file; MintSCAN does not decode
+  or convert it.
+
+Size
+  A4, Letter, Legal or A3. These are fixed request sizes. They are not yet
+  derived from the scanner's maximum bed dimensions.
+
+@{"Back to contents" LINK Main}
+@endnode
+
+@node Saving "Saving files"
+@{b}Saving files@{ub}
+
+Type an AmigaDOS path such as RAM:scan001.jpg or use Browse to open the
+standard ASL save requester. Changing Format updates the filename extension.
+
+Existing files at the chosen path can be replaced. MintSCAN now checks every
+disk write and the HTTP transfer framing. Disk-full, write, timeout and
+truncated-transfer failures remove the partial destination instead of
+reporting it as a successful scan.
+
+@{"Back to contents" LINK Main}
+@endnode
+
+@node Discovery "Discovery and manual Query"
+@{b}Discovery@{ub}
+
+Discover sends an mDNS query for _uscan._tcp.local. MintSCAN reads the
+advertised DNS-SD SRV port and TXT rs= resource path instead of assuming
+port 80 and /eSCL for every scanner.
+
+Some emulators and routed/VLAN networks do not pass mDNS multicast. Enter
+an IPv4 address, optionally followed by :port, and click Query in that case.
+Manual Query uses the conventional /eSCL resource root.
+
+HTTPS-only _uscans._tcp services are intentionally not displayed because
+1.1.0 cannot connect to them yet.
+
+@{"Back to contents" LINK Main}
+@endnode
+
+@node Status "Status and error messages"
+@{b}Status and error messages@{ub}
+
+After a successful Query, the Status field shows the top-level eSCL scanner
+state where supported: Idle, Processing, Testing, Stopped or Down.
+
+The message box reports discovery, selected substitutions, job creation,
+download progress and errors. If ScanJobs fails, MintSCAN queries
+ScannerStatus again so an HTTP error can include the scanner's own state.
+
+All connect, send and receive operations are timeout-bounded. A sleeping
+Wi-Fi scanner receives one additional connection attempt.
+
+@{"Back to contents" LINK Main}
+@endnode
+
+@node Limitations "Known limitations"
+@{b}Known limitations in 1.1.0@{ub}
+
+  * Plain HTTP eSCL only; no HTTPS/AmiSSL yet.
+  * One page per scan; no multi-page ADF loop or duplex.
+  * Source, format and page-size choices are fixed lists.
+  * Capability XML is deliberately parsed lightly rather than with a full
+    XML library.
+  * Manual Query accepts IPv4 and optional port, not hostnames or IPv6.
+  * There is no cancel button during an active scan.
+
+@{"Back to contents" LINK Main}
+@endnode
+
+@node Troubleshooting "Troubleshooting"
+@{b}Troubleshooting@{ub}
+
+Nothing appears after Discover
+  Enter the scanner's IPv4 address and click Query. This is expected with
+  WinUAE SLIRP and networks which do not pass multicast.
+
+Query times out
+  Confirm that the scanner supports eSCL over HTTP and that its web service
+  is reachable from the Amiga VLAN. Wake the scanner and retry.
+
+Wrong DPI or colour
+  Read the Requesting line in MintSCAN's message box. It shows the value
+  actually sent after capability validation.
+
+File will not open
+  Check that the selected format matches the filename extension. MintSCAN
+  1.1.0 rejects incomplete transfers, but scanner firmware can still return
+  a valid container containing bad image data.
+
+For difficult scanner firmware, run windows_escl_probe.py from the source
+repository on a PC connected to the same network.
+
+@{"Back to contents" LINK Main}
+@endnode
+
+@node Reporting "Reporting a problem"
+@{b}Reporting a problem@{ub}
+
+Open an issue at:
+
+https://github.com/boingball/MintSCAN/issues
+
+Include the scanner make/model, AmigaOS version, TCP/IP stack, source,
+colour, DPI, format and size. If possible also attach the output from:
+
+python windows_escl_probe.py SCANNER-IP --dpi 400 --color Grayscale8
+
+Do not include credentials or unrelated network configuration.
+
+@{"Back to contents" LINK Main}
+@endnode
+
+@node History "Version history"
+@{b}1.1.0 - 02 September 2026@{ub}
+
+  * Eight saved scanner profiles.
+  * Timeout-bounded connect, receive and send with Wi-Fi wake retry.
+  * Live ScannerStatus display and clearer job errors.
+  * ASL Browse requester and improved GadTools layout.
+  * DNS-SD SRV port and TXT rs= endpoint discovery.
+  * Complete-transfer and disk-write validation.
+  * Model-scoped Brother BlackAndWhite1 workaround.
+  * Added 400 DPI, installer, AmigaGuide and guarded release packaging.
+
+@{b}1.0.0@{ub}
+
+Initial working eSCL scan-to-file implementation.
+
+@{"Back to contents" LINK Main}
+@endnode
