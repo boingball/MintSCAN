@@ -85,13 +85,16 @@ A Bebbo-style `m68k-amigaos-gcc` toolchain is expected on `PATH`. Override
 ```sh
 make           # build MintScan
 make check     # portable HTTP and DNS-SD parser tests
-make release   # validate art and stage the Aminet archive under release/
+make release   # validate art and stage the Aminet bundle under release/
 make clean
 ```
 
-`make release` deliberately refuses placeholder or wrongly typed Workbench
-icons. Before release, provide the three DiskObjects described in
-[art/README.md](art/README.md). The app icon must request a 131072-byte stack.
+The release target validates the supplied Amiga DiskObjects before staging
+them. It places `MintScan.info` beside the application, `MintSCAN.info`
+beside the release drawer, and `Install.info` beside the Installer script.
+The wrapper `GNUmakefile` then adjusts only the packaged drawer window
+height, leaving the source icons untouched. See
+[art/README.md](art/README.md) for the artwork manifest.
 
 ## Diagnostics and support
 

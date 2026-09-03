@@ -1,23 +1,31 @@
-# MintSCAN artwork checklist
+# MintSCAN artwork and release icons
 
-Replace the existing placeholder files before building the 1.1.0 release.
+The source artwork in this directory is kept separately from the binary
+Workbench DiskObjects used by the Amiga release.
 
-Required release icons:
+Release icons:
 
-- `art/MintScan.info` - Workbench tool icon (`do_Type=3`) for the application.
-- `art/MintSCAN.info` - Workbench drawer icon (`do_Type=2`) for the archive drawer.
-- `art/Install.info` - Workbench project icon (`do_Type=4`) whose default tool is `Installer`.
+- `MintScan.info` - application Workbench tool icon (`WBTOOL`, type 3).
+- `MintSCAN.info` - release drawer icon (`WBDRAWER`, type 2).
+- `Install.info` - Installer project icon (`WBPROJECT`, type 4).
+- `MintSCANFolder.info` - alternate folder/drawer artwork
+  (`WBDRAWER`, type 2), retained as source art.
 
-Set the MintScan tool icon's Workbench **Stack** value to exactly **131072**
-bytes. This matches the application's `__stack` and `$STACK:` request.
+Source PNG artwork:
 
-Source artwork may also be kept here using the MintAMP/MintPRINT convention,
-for example:
+- `MintScan.png` and `MintScan-clicked.png` - application states.
+- `mint-scan.png` and `mint-scan-clicked.png` - alternate application states.
+- `folder-closed.png` and `folder-open.png` - drawer states.
+- `Installer.png` - installer artwork.
 
-- `MintScan.png` and `MintScan-clicked.png`
-- `folder-closed.png` and `folder-open.png`
-- `Install.png` and `Install-selected.png`
+`make release` validates the three release icon types, checks that the
+application icon requests a 131072-byte stack, and rejects byte-identical
+application/drawer icons. It copies only the correctly named release icons
+into their Amiga locations:
 
-`make release` verifies the DiskObject types, stack value, and that the
-application and drawer icons are not byte-identical. It deliberately fails
-with the current placeholders so they cannot accidentally reach Aminet.
+- `release/Install.info` beside `release/Install`.
+- `release/MintSCAN.info` beside `release/MintSCAN/`.
+- `release/MintSCAN/MintScan.info` beside `MintScan`.
+
+The top-level `GNUmakefile` adjusts only the packaged drawer's saved window
+height to 120 pixels; source artwork remains untouched.
