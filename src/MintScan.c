@@ -10,6 +10,7 @@
 #include <proto/exec.h>
 #include <proto/dos.h>
 #include <dos/dos.h>
+#include <dos/dostags.h> /* SYS_Asynch/SYS_Input/SYS_Output */
 #include <proto/intuition.h>
 #include <proto/gadtools.h>
 #include <proto/graphics.h>
