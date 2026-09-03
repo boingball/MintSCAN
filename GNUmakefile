@@ -19,7 +19,7 @@ release:
 	@# Classic Amiga drawer icons store the NewWindow height as a big-endian
 	@# WORD at byte offset 84 (DiskObject header 78 + 6 bytes into DrawerData).
 	@if [ -f release/MintSCAN.info ]; then \
-		printf '\\000\\170' | dd of=release/MintSCAN.info bs=1 seek=84 conv=notrunc 2>/dev/null; \
+		printf '\000\170' | dd of=release/MintSCAN.info bs=1 seek=84 conv=notrunc 2>/dev/null; \
 		echo "Set packaged drawer window height to 120: release/MintSCAN.info"; \
 	fi
 
