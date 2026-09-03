@@ -12,6 +12,7 @@ RELEASE_DIR := release/MintSCAN
 APP_ICON     := $(ART_DIR)/MintScan.info
 DRAWER_ICON  := $(ART_DIR)/MintSCAN.info
 INSTALL_ICON := $(ART_DIR)/Install.info
+FOLDER_ICON  := $(ART_DIR)/MintSCANFolder.info
 
 .PHONY: all help check test-http test-mdns check-art release clean
 
@@ -47,15 +48,25 @@ check-art:
 	@test -f $(APP_ICON) || { echo "Missing $(APP_ICON)"; exit 1; }
 	@test -f $(DRAWER_ICON) || { echo "Missing $(DRAWER_ICON)"; exit 1; }
 	@test -f $(INSTALL_ICON) || { echo "Missing $(INSTALL_ICON)"; exit 1; }
+	@test -f $(FOLDER_ICON) || { echo "Missing $(FOLDER_ICON)"; exit 1; }
 	@set -e; \
 	app_type=$$(dd if=$(APP_ICON) bs=1 skip=48 count=1 2>/dev/null | od -An -tu1 | tr -d ' \\n'); \
 	drawer_type=$$(dd if=$(DRAWER_ICON) bs=1 skip=48 count=1 2>/dev/null | od -An -tu1 | tr -d ' \\n'); \
+	folder_type=$$(dd if=$(FOLDER_ICON) bs=1 skip=48 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]'); \
 	install_type=$$(dd if=$(INSTALL_ICON) bs=1 skip=48 count=1 2>/dev/null | od -An -tu1 | tr -d ' \\n'); \
+	drawer_data=$$(dd if=$(DRAWER_ICON) bs=1 skip=66 count=4 2>/dev/null | od -An -tx1 | tr -d '[:space:]'); \
+	folder_data=$$(dd if=$(FOLDER_ICON) bs=1 skip=66 count=4 2>/dev/null | od -An -tx1 | tr -d '[:space:]'); \
+	install_default=$$(dd if=$(INSTALL_ICON) bs=1 skip=50 count=4 2>/dev/null | od -An -tx1 | tr -d '[:space:]'); \
 	app_stack=$$(dd if=$(APP_ICON) bs=1 skip=74 count=4 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
 	test "$$app_type" = "3" || { echo "ERROR: $(APP_ICON) must be WBTOOL (type 3), got $$app_type"; exit 1; }; \
 	test "$$drawer_type" = "2" || { echo "ERROR: $(DRAWER_ICON) must be WBDRAWER (type 2), got $$drawer_type"; exit 1; }; \
+	test "$$folder_type" = "2" || { echo "ERROR: $(FOLDER_ICON) must be WBDRAWER (type 2), got $$folder_type"; exit 1; }; \
 	test "$$install_type" = "4" || { echo "ERROR: $(INSTALL_ICON) must be WBPROJECT (type 4), got $$install_type"; exit 1; }; \
 	test "$$app_stack" = "00020000" || { echo "ERROR: $(APP_ICON) Stack must be 131072 bytes, got 0x$$app_stack"; exit 1; }
+	test "$$drawer_data" != "00000000" || { echo "ERROR: $(DRAWER_ICON) is missing DrawerData"; exit 1; }; \
+	test "$$folder_data" != "00000000" || { echo "ERROR: $(FOLDER_ICON) is missing DrawerData"; exit 1; }; \
+	test "$$install_default" != "00000000" || { echo "ERROR: $(INSTALL_ICON) is missing a default tool"; exit 1; }; \
+	grep -a -q "C:Installer" $(INSTALL_ICON) || { echo "ERROR: $(INSTALL_ICON) must name C:Installer"; exit 1; }; \
 	@if cmp -s $(APP_ICON) $(DRAWER_ICON); then \
 		echo "ERROR: application and drawer icons are byte-identical"; \
 		exit 1; \
