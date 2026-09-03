@@ -13,6 +13,7 @@ MintSCAN talks directly to a compatible network scanner or multifunction
 printer and saves the returned JPEG, PNG or PDF file on the Amiga. No PC
 scan server and no scanner-specific Amiga driver are required.
 
+@{"Using the menus" LINK Menus}
 @{"Requirements" LINK Requirements}
 @{"Installation" LINK Installation}
 @{"Quick start" LINK QuickStart}
@@ -26,6 +27,20 @@ scan server and no scanner-specific Amiga driver are required.
 @{"Reporting a problem" LINK Reporting}
 @{"Version history" LINK History}
 
+@endnode
+
+@node Menus "Using the menus"
+@{b}Using the menus@{ub}
+
+The File menu contains:
+
+  * About MintSCAN... shows the installed program version and project details.
+  * Quit closes MintSCAN.
+
+The Help menu contains MintSCAN Help..., which opens this guide in
+MultiView or an installed AmigaGuide viewer.
+
+@{"Back to contents" LINK Main}
 @endnode
 
 @node Requirements "Requirements"

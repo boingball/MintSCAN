@@ -5,9 +5,10 @@ Workbench DiskObjects used by the Amiga release.
 
 Release icons:
 
-- `MintScan.info` - application Workbench tool icon (`WBTOOL`, type 3).
-- `MintSCAN.info` - release drawer icon (`WBDRAWER`, type 2).
+- `MintScan.info` - application Workbench tool icon (`WBTOOL`, type 3), using the scanner artwork.
+- `MintSCAN.info` - release drawer icon (`WBDRAWER`, type 2), using the standing-folder artwork.
 - `Install.info` - Installer project icon (`WBPROJECT`, type 4).
+- Both drawer icons include on-disk `DrawerData` so Workbench can render their drawer windows; `Install.info` embeds the `C:Installer` default tool.
 - `MintSCANFolder.info` - alternate folder/drawer artwork
   (`WBDRAWER`, type 2), retained as source art.
 

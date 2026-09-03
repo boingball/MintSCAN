@@ -10,6 +10,7 @@
 #include <proto/exec.h>
 #include <proto/dos.h>
 #include <dos/dos.h>
+#include <dos/dostags.h> /* SYS_Asynch/SYS_Input/SYS_Output */
 #include <proto/intuition.h>
 #include <proto/gadtools.h>
 #include <proto/graphics.h>
@@ -209,9 +210,20 @@ struct GfxBase *GfxBase = NULL;
    than the app refusing to start over a nice-to-have. */
 struct Library *AslBase = NULL;
 static BOOL operation_in_progress = FALSE;
+static struct Menu *menu = NULL;
 
 static struct TextAttr Topaz80 = { (STRPTR)"topaz.font", 8, 0, 0 };
 static struct TextAttr Topaz60 = { (STRPTR)"topaz.font", 6, 0, 0 };
+
+static struct NewMenu menu_template[] = {
+    { NM_TITLE, (STRPTR)"File", 0, 0, 0, 0 },
+    { NM_ITEM,  (STRPTR)"About MintSCAN...", 0, 0, 0, 0 },
+    { NM_ITEM,  NM_BARLABEL, 0, 0, 0, 0 },
+    { NM_ITEM,  (STRPTR)"Quit", 0, 0, 0, 0 },
+    { NM_TITLE, (STRPTR)"Help", 0, 0, 0, 0 },
+    { NM_ITEM,  (STRPTR)"MintSCAN Help...", 0, 0, 0, 0 },
+    { NM_END,   NULL, 0, 0, 0, 0 }
+};
 
 /* status/progress output goes to the on-screen box, never a console -
    this may be launched from Workbench, where there is no console. */
@@ -2222,6 +2234,97 @@ static void do_browse_savepath(struct Window *win) {
     FreeAslRequest(fr);
 }
 
+static BOOL mintscan_file_exists(CONST_STRPTR name) {
+    BPTR lock = Lock(name, ACCESS_READ);
+    if (lock) {
+        UnLock(lock);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void launch_help_guide(void) {
+    BPTR in;
+    BPTR out;
+    BPTR lock;
+    char dir[192];
+    char guide[224];
+    char cmd[320];
+    CONST_STRPTR viewer = NULL;
+    BOOL resolved = FALSE;
+
+    if (mintscan_file_exists((CONST_STRPTR)"SYS:Utilities/MultiView"))
+        viewer = (CONST_STRPTR)"SYS:Utilities/MultiView";
+    else if (mintscan_file_exists((CONST_STRPTR)"C:MultiView"))
+        viewer = (CONST_STRPTR)"C:MultiView";
+    else if (mintscan_file_exists((CONST_STRPTR)"SYS:Utilities/AmigaGuide"))
+        viewer = (CONST_STRPTR)"SYS:Utilities/AmigaGuide";
+    else if (mintscan_file_exists((CONST_STRPTR)"C:AmigaGuide"))
+        viewer = (CONST_STRPTR)"C:AmigaGuide";
+
+    if (!viewer) {
+        printf("No AmigaGuide help viewer is installed.\n");
+        printf("Use an AmigaGuide viewer such as MultiView or Commodore AmigaGuide V34.\n");
+        return;
+    }
+
+    lock = Lock((CONST_STRPTR)"PROGDIR:", ACCESS_READ);
+    if (lock) {
+        resolved = NameFromLock(lock, (STRPTR)dir, sizeof(dir));
+        UnLock(lock);
+    }
+
+    if (!resolved) {
+        printf("Could not resolve the MintSCAN program drawer.\n");
+        printf("Open MintSCAN.guide manually.\n");
+        return;
+    }
+
+    {
+        size_t len = strlen(dir);
+        const char *sep = (len && dir[len - 1] == ':') ? "" : "/";
+        snprintf(guide, sizeof(guide), "%s%sMintSCAN.guide", dir, sep);
+    }
+
+    if (!mintscan_file_exists((CONST_STRPTR)guide)) {
+        printf("MintSCAN.guide is missing from the program drawer.\n");
+        return;
+    }
+
+    snprintf(cmd, sizeof(cmd), "%s \"%s\"", (const char *)viewer, guide);
+    in = Open((CONST_STRPTR)"NIL:", MODE_OLDFILE);
+    out = Open((CONST_STRPTR)"NIL:", MODE_NEWFILE);
+
+    if (SystemTags((CONST_STRPTR)cmd,
+                   SYS_Asynch, TRUE,
+                   SYS_Input, (ULONG)in, SYS_Output, (ULONG)out,
+                   TAG_DONE) != 0) {
+        printf("Could not open MintSCAN.guide automatically.\n");
+        if (in) Close(in);
+        if (out) Close(out);
+    }
+}
+
+static void show_about(struct Window *win) {
+    struct EasyStruct es;
+    char msg[384];
+
+    snprintf(msg, sizeof(msg),
+        "MintSCAN v" MINTSCAN_VERSION
+        " - eSCL/AirScan scanning for AmigaOS\n\n"
+        "Discover network scanners and save JPEG, PNG or PDF scans.\n\n"
+        "github.com/boingball/MintSCAN\n\n"
+        "Copyright (c) 2026 Darren Banfi\n"
+        "MIT License");
+
+    es.es_StructSize = sizeof(struct EasyStruct);
+    es.es_Flags = 0;
+    es.es_Title = (UBYTE *)"About MintSCAN";
+    es.es_TextFormat = (UBYTE *)msg;
+    es.es_GadgetFormat = (UBYTE *)"OK";
+    EasyRequest(win, &es, NULL);
+}
+
 static void process_window_events(struct Window *win) {
     struct IntuiMessage *imsg;
     ULONG imsgClass;
@@ -2426,6 +2529,30 @@ static void process_window_events(struct Window *win) {
                     terminated = TRUE;
                     break;
 
+                case IDCMP_MENUPICK:
+                {
+                    ULONG code = imsg->Code;
+                    while (code != MENUNULL) {
+                        UWORD menu_num = MENUNUM(code);
+                        UWORD item_num = ITEMNUM(code);
+
+                        if (menu_num == 0) {
+                            switch (item_num) {
+                                case 0:
+                                    show_about(win);
+                                    break;
+                                case 2:
+                                    terminated = TRUE;
+                                    break;
+                            }
+                        } else if (menu_num == 1 && item_num == 0) {
+                            launch_help_guide();
+                        }
+
+                        code = MENUNULL;
+                    }
+                    break;
+                }
                 case IDCMP_REFRESHWINDOW:
                     GT_BeginRefresh(win);
                     GT_EndRefresh(win, TRUE);
@@ -2562,7 +2689,7 @@ int main(void) {
         WA_SizeGadget, TRUE,
         WA_SimpleRefresh, TRUE,
         WA_NewLookMenus, TRUE,
-        WA_IDCMP, IDCMP_CLOSEWINDOW | IDCMP_REFRESHWINDOW | STRINGIDCMP | BUTTONIDCMP | CYCLEIDCMP,
+        WA_IDCMP, IDCMP_CLOSEWINDOW | IDCMP_REFRESHWINDOW | STRINGIDCMP | BUTTONIDCMP | CYCLEIDCMP | IDCMP_MENUPICK,
         WA_PubScreen, (ULONG)screen,
         TAG_DONE);
 
@@ -2577,6 +2704,18 @@ int main(void) {
         CloseLibrary((struct Library *)GfxBase);
         CloseLibrary((struct Library *)IntuitionBase);
         return 1;
+    }
+
+    menu = CreateMenus(menu_template, TAG_DONE);
+    if (menu) {
+        LayoutMenus(menu, vi,
+            GTMN_NewLookMenus, TRUE,
+            GTMN_FrontPen, 1,
+            GTNM_BackPen, 0,
+            TAG_DONE);
+        SetMenuStrip(window, menu);
+    } else {
+        printf("Failed to create menus\n");
     }
 
     custom_printf("CLEAR");
@@ -2596,8 +2735,10 @@ int main(void) {
 
     process_window_events(window);
 
+    if (window && menu) ClearMenuStrip(window);
     if (window) { CloseWindow(window); window = NULL; }
     if (glist) { FreeGadgets(glist); glist = NULL; }
+    if (menu) { FreeMenus(menu); menu = NULL; }
 
     if (vi) { FreeVisualInfo(vi); vi = NULL; }
     if (screen) { UnlockPubScreen(NULL, screen); screen = NULL; }
