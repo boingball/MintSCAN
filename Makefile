@@ -66,7 +66,7 @@ check-art:
 	test "$$drawer_data" != "00000000" || { echo "ERROR: $(DRAWER_ICON) is missing DrawerData"; exit 1; }; \
 	test "$$folder_data" != "00000000" || { echo "ERROR: $(FOLDER_ICON) is missing DrawerData"; exit 1; }; \
 	test "$$install_default" != "00000000" || { echo "ERROR: $(INSTALL_ICON) is missing a default tool"; exit 1; }; \
-	grep -a -q "C:Installer" $(INSTALL_ICON) || { echo "ERROR: $(INSTALL_ICON) must name C:Installer"; exit 1; }; \
+	grep -a -q "C:Installer" $(INSTALL_ICON) || { echo "ERROR: $(INSTALL_ICON) must name C:Installer"; exit 1; }
 	@if cmp -s $(APP_ICON) $(DRAWER_ICON); then \
 		echo "ERROR: application and drawer icons are byte-identical"; \
 		exit 1; \
