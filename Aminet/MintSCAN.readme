@@ -75,6 +75,9 @@ Quick start
 
 Saved profiles live in ENV:MintSCAN/Unit0-Unit7 and matching ENVARC: files.
 
+Use `File > About MintSCAN...` for version and project details. `Help > MintSCAN Help...`
+opens the supplied AmigaGuide manual when MultiView or AmigaGuide is installed.
+
 Limitations
 -----------
 

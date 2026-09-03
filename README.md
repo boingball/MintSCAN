@@ -55,6 +55,9 @@ does not use AmiSSL.
 5. Click **Scan**.
 6. Click **Save Config** to retain the settings in the selected Unit.
 
+Use `File > About MintSCAN...` for version and project details. `Help > MintSCAN Help...`
+opens the AmigaGuide manual shipped beside the program.
+
 The scanner creates the JPEG, PNG, or PDF data; MintSCAN streams it unchanged
 to disk. A successful scan is only reported after the HTTP transfer and file
 close have completed.
