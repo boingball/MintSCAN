@@ -81,7 +81,7 @@ static const char USED version_tag[] = "$VER: MintScan 1.1.0 (02.09.2026)";
 #define MAX_BUFFER    65536   /* capabilities / ScanJobs response scratch */
 #define MAX_OUTPUT_LINES 8
 #define MAX_OUTPUT_LINE_LENGTH 55
-#define OUTPUT_TOP    259
+#define OUTPUT_TOP    232
 #define OUTPUT_LEFT   10
 #define OUTPUT_LINE_H 10
 #define OUTPUT_RIGHT  (window->Width - 20)
@@ -546,13 +546,17 @@ static BOOL load_unit_config(int idx) {
         discovered[0].port = scanner_port;
         strncpy(discovered[0].root, scanner_root, sizeof(discovered[0].root) - 1);
         discovered[0].root[sizeof(discovered[0].root) - 1] = '\0';
-        /* Just the IP, not "IP (Model)" - the Model field right below the
-           Scanner dropdown already shows the model name, and the combined
-           label was long enough (a real make/model easily runs past 20
-           characters) to get clipped behind the Discover button in the
-           cycle gadget's fixed-width box. */
-        snprintf(discovered[0].label, sizeof(discovered[0].label),
-                 "%s (saved)", scanner_host);
+        /* Keep the cycle entry useful at a glance: show the saved model
+           when available, not the connection address. The IP remains in
+           scanner_host for the actual eSCL requests and is still shown in
+           the diagnostic output when discovery is performed. */
+        if (scanner_make_model[0]) {
+            snprintf(discovered[0].label, sizeof(discovered[0].label),
+                     "%s", scanner_make_model);
+        } else {
+            snprintf(discovered[0].label, sizeof(discovered[0].label),
+                     "%s (saved)", scanner_host);
+        }
         discovered_count = 1;
     }
     return TRUE;
@@ -804,16 +808,21 @@ static int mdns_discover_scanners(int count_io, int max_results,
             discovered[count].root[sizeof(discovered[count].root) - 1] = '\0';
 
             if (endpoint.label[0]) {
+                /* The endpoint label is the scanner name (TXT ty=). The
+                   address is retained in discovered[].ip/port for use by
+                   the network code, but does not belong in the visible
+                   cycle gadget. */
                 snprintf(discovered[count].label,
-                         sizeof(discovered[count].label), "%s (%s:%d)",
-                         endpoint.label, ipstr, endpoint.port);
+                         sizeof(discovered[count].label), "%s",
+                         endpoint.label);
             } else {
                 snprintf(discovered[count].label,
                          sizeof(discovered[count].label), "%s:%d",
                          ipstr, endpoint.port);
             }
-            printf("Discovery: found %s at %s\n",
-                   discovered[count].label, discovered[count].root);
+            printf("Discovery: found %s at %s:%d%s\n",
+                   discovered[count].label, ipstr, endpoint.port,
+                   discovered[count].root);
             count++;
         }
     }
@@ -2680,8 +2689,8 @@ int main(void) {
         WA_AutoAdjust, TRUE,
         WA_Width, 480,
         WA_MinWidth, 480,
-        WA_InnerHeight, 354,
-        WA_MinHeight, 354,
+        WA_InnerHeight, OUTPUT_TOP + (MAX_OUTPUT_LINES * (font->tf_YSize + 2)) + 2,
+        WA_MinHeight, OUTPUT_TOP + (MAX_OUTPUT_LINES * (font->tf_YSize + 2)) + 2,
         WA_DragBar, TRUE,
         WA_DepthGadget, TRUE,
         WA_Activate, TRUE,

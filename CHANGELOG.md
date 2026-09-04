@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Show discovered scanner names without appending their IP address, while
+  retaining the endpoint internally for network requests.
+- Tighten the status/output panel to match MintPRINT's compact layout, with
+  no unused gap above or below the box.
+
 ## 1.1.0 - 2026-09-02
 
 - Added Unit0-Unit7 saved scanner profiles.
