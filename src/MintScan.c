@@ -33,6 +33,7 @@ typedef long ssize_t;
 
 #include "http_response.h"
 #include "mdns_endpoint.h"
+#include "escl_format.h"
 
 #define USED __attribute__((used))
 
@@ -1816,8 +1817,10 @@ static void query_capabilities(const char *ip, int port) {
    scanner firmware is permissive enough to return 201 Created for a
    request it doesn't fully understand, then silently performs a default
    scan instead, so don't send the extension blindly. */
-static BOOL source_uses_document_format_ext(void) {
-    static char scoped[8192];
+/* Only send the extension if this source advertises this exact MIME.
+   Advertising JPEG in DocumentFormatExt is not support for PNG there. */
+static BOOL source_uses_document_format_ext(const char *mime) {
+    static char scoped[MAX_BUFFER];
     const char *scope;
 
     if (!have_capabilities) return FALSE;
@@ -1827,14 +1830,34 @@ static BOOL source_uses_document_format_ext(void) {
                          scoped, sizeof(scoped));
     scope = scoped[0] ? scoped : capabilities_xml;
 
-    return strstr(scope, "DocumentFormatExt") != NULL;
+    return ms_escl_has_format_value(scope, "scan:DocumentFormatExt", mime) != 0;
+}
+
+/* Prevent predictable HTTP 409s for PNG when this source advertises only
+   JPEG/PDF. Never silently create a JPEG and give it a .png extension.
+   An old scanner with no format list is left to handle the request. */
+static BOOL source_supports_selected_png(void) {
+    static char scoped[MAX_BUFFER];
+    const char *scope;
+    int known = 0;
+
+    if (format_index != 1 || !have_capabilities) return TRUE;
+    scoped[0] = '\0';
+    extract_source_block(capabilities_xml, source_capability_tags[source_index],
+                         scoped, sizeof(scoped));
+    scope = scoped[0] ? scoped : capabilities_xml;
+    if (ms_escl_format_supported(scope, "image/png", &known) || !known)
+        return TRUE;
+    printf("PNG is not advertised for %s - select JPEG or PDF instead\n",
+           (char *)source_labels[source_index]);
+    return FALSE;
 }
 
 static void build_scan_settings_xml(char *buf, int buf_size) {
     int dpi = resolve_dpi();
     const char *mime = format_mimes[format_index];
     const char *color_value = resolve_color_value();
-    BOOL use_document_format_ext = source_uses_document_format_ext();
+    BOOL use_document_format_ext = source_uses_document_format_ext(mime);
     char format_ext[128];
 
     /* Brother MFC-J6930DW firmware is known to return banded colour
@@ -1898,6 +1921,7 @@ static void do_scan(void) {
         printf("No scanner selected - use Discover first\n");
         return;
     }
+    if (!source_supports_selected_png()) return;
 
     build_scan_settings_xml(xml, sizeof(xml));
 
@@ -1906,6 +1930,8 @@ static void do_scan(void) {
     status = http_post_xml(scanner_host, scanner_port, jobs_path, xml,
                            location, sizeof(location));
     if (status != 201 || !location[0]) {
+        if (status == 409 && format_index == 1)
+            printf("Scanner rejected PNG settings - check its advertised formats\n");
         query_scanner_status(scanner_host, scanner_port);
         if (scanner_status_text[0]) {
             printf("ScanJobs failed (status %d) - scanner reports: %s\n", status, scanner_status_text);

@@ -14,18 +14,18 @@ DRAWER_ICON  := $(ART_DIR)/MintSCAN.info
 INSTALL_ICON := $(ART_DIR)/Install.info
 FOLDER_ICON  := $(ART_DIR)/MintSCANFolder.info
 
-.PHONY: all help check test-http test-mdns check-art release clean
+.PHONY: all help check test-http test-mdns test-format check-art release clean
 
 all: MintScan
 
 help:
 	@echo "MintSCAN targets:"
 	@echo "  make           - build MintScan for m68k AmigaOS"
-	@echo "  make check     - run host-side HTTP and DNS-SD tests"
+	@echo "  make check     - run host-side HTTP, DNS-SD and format tests"
 	@echo "  make release   - build, validate art and stage the Aminet bundle"
 	@echo "  make clean"
 
-MintScan: src/MintScan.c src/http_response.c src/http_response.h src/mdns_endpoint.c src/mdns_endpoint.h
+MintScan: src/MintScan.c src/escl_format.h src/http_response.c src/http_response.h src/mdns_endpoint.c src/mdns_endpoint.h
 	$(CC) $(CFLAGS) -Isrc -o $@ src/MintScan.c src/http_response.c src/mdns_endpoint.c -lamiga -lm
 
 $(TEST_DIR):
@@ -39,7 +39,11 @@ test-mdns: | $(TEST_DIR)
 	$(HOST_CC) $(HOST_CFLAGS) -Isrc -o $(TEST_DIR)/test_mdns_endpoint tests/test_mdns_endpoint.c src/mdns_endpoint.c
 	$(TEST_DIR)/test_mdns_endpoint
 
-check: test-http test-mdns
+test-format: | $(TEST_DIR)
+	$(HOST_CC) $(HOST_CFLAGS) -Isrc -o $(TEST_DIR)/test_escl_format tests/test_escl_format.c
+	$(TEST_DIR)/test_escl_format
+
+check: test-http test-mdns test-format
 
 # The release icons are real Amiga DiskObjects, not PNGs. Their type byte is
 # checked here so a tool icon can never be shipped as a drawer or installer
