@@ -1,0 +1,28 @@
+name: Integrate issue 8 fix
+
+on:
+  push:
+    branches: [fix/issue-8-png-capabilities]
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply issue 8 fix and run host tests
+        run: |
+          set -eu
+          python3 tools/apply_issue8.py
+          make check
+      - name: Commit source changes and remove temporary integration tools
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f -- tools/apply_issue8.py .github/workflows/integrate-issue8.yml
+          git add -- src/MintScan.c src/escl_format.h tests/test_escl_format.c Makefile
+          git commit -m "Validate PNG against eSCL capabilities before ScanJobs (#8)"
+          git push origin HEAD:fix/issue-8-png-capabilities
