@@ -1,5 +1,5 @@
-; MintSCAN 1.1.0 Installer script
-; $VER: Install-MintSCAN 1.1.0 (02.09.2026)
+; MintSCAN 1.1.1 Installer script
+; $VER: Install-MintSCAN 1.1.1 (10.10.2026)
 ;
 ; MintSCAN is a standalone application. No driver, device, library or system
 ; file is installed, and no reboot is required.
@@ -7,7 +7,7 @@
 (set #ms-appname "MintSCAN")
 
 (message
-    "MintSCAN 1.1.0 setup\n\n"
+    "MintSCAN 1.1.1 setup\n\n"
     "MintSCAN scans directly from eSCL/AirScan network scanners to files "
     "on a classic Amiga. This installer only copies the application drawer; "
     "it does not change DEVS:, LIBS: or any system preferences."
