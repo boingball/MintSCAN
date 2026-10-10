@@ -16,9 +16,11 @@ Amiga. It is the scanning companion to
 [MintPRINT](https://github.com/boingball/MintPRINT): no PC scan server,
 vendor-specific Amiga driver, or system modification is required.
 
-## Version 1.1.0
+## Version 1.1.1
 
-The 1.1.0 release adds and hardens:
+Version 1.1.1 improves scanner discovery display and tightens the status/output panel layout.
+
+The previous 1.1.0 release added and hardened:
 
 - Eight independent saved scanner profiles (Unit0 to Unit7).
 - Live scanner state, manual IPv4/port Query, and an ASL save requester.
