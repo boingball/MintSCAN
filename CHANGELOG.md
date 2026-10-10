@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.1.1 - 2026-10-10
+
 - Show discovered scanner names without appending their IP address, while
   retaining the endpoint internally for network requests.
 - Tighten the status/output panel to match MintPRINT's compact layout, with
