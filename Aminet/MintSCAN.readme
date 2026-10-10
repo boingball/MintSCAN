@@ -2,7 +2,7 @@ Short:        eSCL/AirScan scanning application
 Author:       Darren Banfi (boingball)
 Uploader:     boingball@gmail.com
 Type:         gfx/misc
-Version:      1.1.0
+Version:      1.1.1
 Requires:     68000+; AmigaOS 3.0+; TCP/IP stack with bsdsocket.library
 Architecture: m68k-amigaos >= 3.0.0
 
@@ -81,7 +81,7 @@ opens the supplied AmigaGuide manual when MultiView or AmigaGuide is installed.
 Limitations
 -----------
 
-  - Plain HTTP eSCL only; no HTTPS/AmiSSL in 1.1.0
+  - Plain HTTP eSCL only; no HTTPS/AmiSSL in 1.1.1
   - One page per scan; no multi-page feeder loop or duplex
   - Fixed Source, Format and Size lists
   - Manual Query accepts IPv4, not hostnames or IPv6
@@ -115,6 +115,9 @@ MIT License. See LICENSE in the archive.
 
 History
 -------
+
+1.1.1  Cleaner scanner names in discovery lists and a compact status/output
+       panel layout with unused vertical gaps removed.
 
 1.1.0  Saved Unit profiles; live status; ASL Browse; network timeouts and
        Wi-Fi retry; advertised port/root discovery; robust HTTP framing and

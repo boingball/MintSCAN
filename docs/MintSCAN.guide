@@ -1,11 +1,11 @@
 @database MintSCAN.guide
-@$VER: MintSCAN.guide 1.1.0 (02.09.2026)
+@$VER: MintSCAN.guide 1.1.1 (10.10.2026)
 @author "MintSCAN project (boingball)"
 @(c) "Copyright (c) 2026 Darren Banfi (boingball). MIT License."
 @width 74
 
 @node Main "MintSCAN Help"
-@{b}MintSCAN 1.1.0@{ub}
+@{b}MintSCAN 1.1.1@{ub}
 
 Modern eSCL/AirScan network scanning for classic AmigaOS.
 
@@ -56,7 +56,7 @@ MintSCAN requests a 128 KiB stack. Use the supplied MintScan.info when
 starting from Workbench. Scanned image data is streamed directly to the
 destination file rather than being held completely in memory.
 
-HTTPS-only _uscans devices are not supported in 1.1.0 because AmiSSL has
+HTTPS-only _uscans devices are not supported in 1.1.1 because AmiSSL has
 not yet been connected to the eSCL client.
 
 @{"Back to contents" LINK Main}
@@ -115,7 +115,7 @@ separate Activate step because MintSCAN has no background driver.
 @{b}Scan options@{ub}
 
 Source
-  Flatbed (Platen) or Feeder (ADF). Version 1.1.0 retrieves one page only;
+  Flatbed (Platen) or Feeder (ADF). Version 1.1.1 retrieves one page only;
   it does not loop through a multi-page feeder job.
 
 Colour
@@ -166,7 +166,7 @@ an IPv4 address, optionally followed by :port, and click Query in that case.
 Manual Query uses the conventional /eSCL resource root.
 
 HTTPS-only _uscans._tcp services are intentionally not displayed because
-1.1.0 cannot connect to them yet.
+1.1.1 cannot connect to them yet.
 
 @{"Back to contents" LINK Main}
 @endnode
@@ -188,7 +188,7 @@ Wi-Fi scanner receives one additional connection attempt.
 @endnode
 
 @node Limitations "Known limitations"
-@{b}Known limitations in 1.1.0@{ub}
+@{b}Known limitations in 1.1.1@{ub}
 
   * Plain HTTP eSCL only; no HTTPS/AmiSSL yet.
   * One page per scan; no multi-page ADF loop or duplex.
@@ -218,7 +218,7 @@ Wrong DPI or colour
 
 File will not open
   Check that the selected format matches the filename extension. MintSCAN
-  1.1.0 rejects incomplete transfers, but scanner firmware can still return
+  1.1.1 rejects incomplete transfers, but scanner firmware can still return
   a valid container containing bad image data.
 
 For difficult scanner firmware, run windows_escl_probe.py from the source
@@ -245,6 +245,11 @@ Do not include credentials or unrelated network configuration.
 @endnode
 
 @node History "Version history"
+@{b}1.1.1 - 10 October 2026@{ub}
+
+  * Cleaner scanner names in discovery results.
+  * Compact status/output panel layout with excess spacing removed.
+
 @{b}1.1.0 - 02 September 2026@{ub}
 
   * Eight saved scanner profiles.

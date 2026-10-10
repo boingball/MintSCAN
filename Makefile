@@ -89,7 +89,7 @@ release: check MintScan check-art
 	cp $(DRAWER_ICON) release/MintSCAN.info
 	cp Aminet/MintSCAN.readme release/MintSCAN.readme
 	@echo
-	@echo "MintSCAN 1.1.0 release staged under release/:"
+	@echo "MintSCAN 1.1.1 release staged under release/:"
 	@echo "  Install / Install.info"
 	@echo "  MintSCAN.info"
 	@echo "  MintSCAN.readme"

@@ -65,8 +65,8 @@ static const char USED min_stack[] = "$STACK:131072";
 #define GAD_STATUS_DISPLAY   16
 #define GAD_BROWSE_BUTTON    17
 
-#define MINTSCAN_VERSION "1.1.0"
-static const char USED version_tag[] = "$VER: MintScan 1.1.0 (02.09.2026)";
+#define MINTSCAN_VERSION "1.1.1"
+static const char USED version_tag[] = "$VER: MintScan 1.1.1 (10.10.2026)";
 
 /* Saved scanner profiles: ENV(ARC):MintSCAN/Unit0 .. Unit(MAX_UNITS-1),
    switched via GAD_UNIT_DROPDOWN - same Unit0-7 idea as MintPRINT's
